@@ -1,0 +1,39 @@
+<node>
+  <interface name="org.sagecat.GnomeWinCtl1">
+    <method name="GetCapabilities">
+      <arg type="s" direction="out" name="capabilities"/>
+    </method>
+    <method name="GetState">
+      <arg type="s" direction="out" name="state"/>
+    </method>
+    <method name="ListWindows">
+      <arg type="s" direction="out" name="windows"/>
+    </method>
+    <method name="ListMonitors">
+      <arg type="s" direction="out" name="monitors"/>
+    </method>
+    <method name="ListWorkspaces">
+      <arg type="s" direction="out" name="workspaces"/>
+    </method>
+    <method name="PlaceWindow">
+      <arg type="s" direction="in" name="selector"/>
+      <arg type="s" direction="in" name="target"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <method name="ExpectWindow">
+      <arg type="s" direction="in" name="selector"/>
+      <arg type="s" direction="in" name="target"/>
+      <arg type="u" direction="in" name="timeout_ms"/>
+      <arg type="s" direction="out" name="token"/>
+    </method>
+    <method name="ExpectationStatus">
+      <arg type="s" direction="in" name="token"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
+    <method name="CancelExpectation">
+      <arg type="s" direction="in" name="token"/>
+      <arg type="b" direction="out" name="cancelled"/>
+    </method>
+  </interface>
+</node>
+
