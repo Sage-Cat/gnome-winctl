@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from gnome_winctl.cli import _geometry, _selector, main
-from gnome_winctl.client import _gdbus_value, normalize_target
+from gnome_winctl.client import _gdbus_value, add_monitor_identities, normalize_target
 
 
 STATE = {
@@ -70,6 +72,33 @@ class ClientTests(unittest.TestCase):
         }, STATE)
         self.assertEqual(target["workspace"], 1)
         self.assertEqual(target["monitor"], 1)
+
+    def test_enriches_shell_monitor_with_persistent_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".config").mkdir()
+            (home / ".config/monitors.xml").write_text("""
+<monitors version="2"><configuration><logicalmonitor>
+<x>1920</x><y>0</y><scale>2</scale><monitor><monitorspec>
+<connector>DP-1</connector><vendor>GSM</vendor>
+<product>LG HDR 4K</product><serial>ABC</serial>
+</monitorspec><mode><width>3840</width><height>2160</height></mode></monitor>
+</logicalmonitor></configuration></monitors>
+""")
+            state = {
+                "monitors": [{
+                    "index": 0, "x": 1920, "y": 0,
+                    "width": 1920, "height": 1080,
+                }],
+                "windows": [{"monitor": 0}],
+            }
+            with patch("gnome_winctl.client.Path.home", return_value=home), patch(
+                "gnome_winctl.client._edid_hashes", return_value={"DP-1": "edid"},
+            ):
+                add_monitor_identities(state)
+        self.assertEqual(state["monitors"][0]["identity"]["serial"], "ABC")
+        self.assertEqual(state["monitors"][0]["identity"]["edid_hash"], "edid")
+        self.assertEqual(state["windows"][0]["monitor_identity"]["product"], "LG HDR 4K")
 
 
 class CliTests(unittest.TestCase):
