@@ -12,6 +12,9 @@ from xml.etree import ElementTree
 BUS = "org.sagecat.GnomeWinCtl1"
 OBJECT = "/org/sagecat/GnomeWinCtl1"
 INTERFACE = BUS
+LEGACY_BUS = "org.sagecat.WorkspaceState"
+LEGACY_OBJECT = "/org/sagecat/WorkspaceState"
+LEGACY_INTERFACE = LEGACY_BUS
 
 
 class WinCtlError(RuntimeError):
@@ -54,12 +57,100 @@ def _call(method: str, *arguments: str, timeout: float = 10) -> Any:
     return _gdbus_value(output)
 
 
+def _legacy_call(method: str, *arguments: str, timeout: float = 10) -> Any:
+    output = _run([
+        "gdbus", "call", "--session", "--dest", LEGACY_BUS,
+        "--object-path", LEGACY_OBJECT,
+        "--method", f"{LEGACY_INTERFACE}.{method}",
+        *arguments,
+    ], timeout=timeout)
+    return _gdbus_value(output)
+
+
 def _json_call(method: str, *arguments: str, timeout: float = 10) -> Any:
     payload = _call(method, *arguments, timeout=timeout)
     try:
         return json.loads(str(payload))
     except (TypeError, json.JSONDecodeError) as error:
         raise WinCtlError(f"{method} returned invalid JSON") from error
+
+
+def _legacy_json_call(method: str, *arguments: str, timeout: float = 10) -> Any:
+    payload = _legacy_call(method, *arguments, timeout=timeout)
+    try:
+        return json.loads(str(payload))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise WinCtlError(f"legacy {method} returned invalid JSON") from error
+
+
+def _workspace_names() -> list[str]:
+    try:
+        raw = _run([
+            "gsettings", "get", "org.gnome.desktop.wm.preferences",
+            "workspace-names",
+        ])
+        value = ast.literal_eval(raw.removeprefix("@as "))
+    except (OSError, SyntaxError, ValueError, WinCtlError):
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _legacy_state() -> dict[str, Any]:
+    state = _legacy_json_call("Capture")
+    if not isinstance(state, dict):
+        raise WinCtlError("legacy Capture did not return an object")
+
+    names = _workspace_names()
+    active = int(state.get("active_workspace", 0))
+    highest = max(
+        [active, *(int(item.get("workspace", 0)) for item in state.get("windows", []))],
+        default=0,
+    )
+    count = max(len(names), highest + 1)
+    state.update({
+        "interface": LEGACY_BUS,
+        "interface_version": 0,
+        "backend": "legacy-session-bridge",
+        "degraded": True,
+        "capabilities": ["list_windows", "list_monitors", "list_workspaces", "place_window"],
+        "workspaces": [
+            {
+                "index": index,
+                "name": names[index] if index < len(names) and names[index]
+                else f"Workspace {index + 1}",
+                "active": index == active,
+            }
+            for index in range(count)
+        ],
+    })
+    monitors = {
+        int(item.get("index", -1)): item for item in state.get("monitors", [])
+    }
+    for window in state.get("windows", []):
+        monitor = monitors.get(int(window.get("monitor", -1)))
+        geometry = window.get("geometry") or {}
+        if monitor and geometry:
+            window["geometry_relative"] = {
+                "x": int(geometry.get("x", 0)) - int(monitor.get("x", 0)),
+                "y": int(geometry.get("y", 0)) - int(monitor.get("y", 0)),
+                "width": int(geometry.get("width", 1)),
+                "height": int(geometry.get("height", 1)),
+            }
+        window.setdefault(
+            "state",
+            "fullscreen" if window.get("fullscreen")
+            else "maximized" if window.get("maximized")
+            else "normal",
+        )
+        identifiers = [
+            window.get("app_id"), window.get("wm_class"),
+            window.get("wm_class_instance"), window.get("sandboxed_app_id"),
+        ]
+        window["app_ids"] = sorted({
+            str(item).lower().removesuffix(".desktop")
+            for item in identifiers if item
+        })
+    return state
 
 
 def _edid_hashes() -> dict[str, str]:
@@ -148,14 +239,36 @@ def add_monitor_identities(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_state() -> dict[str, Any]:
-    state = _json_call("GetState")
+    try:
+        state = _json_call("GetState")
+    except WinCtlError as primary_error:
+        try:
+            state = _legacy_state()
+        except WinCtlError as legacy_error:
+            raise WinCtlError(
+                f"placement service unavailable: {primary_error}; "
+                f"legacy session bridge unavailable: {legacy_error}",
+            ) from primary_error
     if not isinstance(state, dict):
         raise WinCtlError("GetState did not return an object")
     return add_monitor_identities(state)
 
 
 def get_capabilities() -> dict[str, Any]:
-    value = _json_call("GetCapabilities")
+    try:
+        value = _json_call("GetCapabilities")
+    except WinCtlError as primary_error:
+        try:
+            state = _legacy_state()
+        except WinCtlError as legacy_error:
+            raise WinCtlError(
+                f"placement service unavailable: {primary_error}; "
+                f"legacy session bridge unavailable: {legacy_error}",
+            ) from primary_error
+        return {
+            key: state[key]
+            for key in ("interface", "interface_version", "backend", "degraded", "capabilities")
+        }
     if not isinstance(value, dict):
         raise WinCtlError("GetCapabilities did not return an object")
     return value
@@ -247,15 +360,76 @@ def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str,
 
 
 def place_window(selector: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
-    normalized = normalize_target(target, get_state())
-    result = _json_call(
-        "PlaceWindow",
-        json.dumps(selector, separators=(",", ":")),
-        json.dumps(normalized, separators=(",", ":")),
-    )
+    state = get_state()
+    normalized = normalize_target(target, state)
+    try:
+        result = _json_call(
+            "PlaceWindow",
+            json.dumps(selector, separators=(",", ":")),
+            json.dumps(normalized, separators=(",", ":")),
+        )
+    except WinCtlError:
+        if state.get("backend") != "legacy-session-bridge":
+            raise
+        return _legacy_place_window(selector, normalized, state)
     if not isinstance(result, dict):
         raise WinCtlError("PlaceWindow did not return an object")
     return result
+
+
+def _legacy_place_window(
+    selector: dict[str, Any],
+    target: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    windows = state.get("windows", [])
+    if selector.get("title") is not None:
+        title = str(selector["title"])
+    else:
+        matches = []
+        for window in windows:
+            if selector.get("id") is not None and window.get("id") != selector["id"]:
+                continue
+            if selector.get("pid") is not None and int(window.get("pid", -1)) != int(selector["pid"]):
+                continue
+            if selector.get("app_id") is not None:
+                app_id = str(selector["app_id"]).lower().removesuffix(".desktop")
+                if app_id not in window.get("app_ids", []):
+                    continue
+            matches.append(window)
+        if len(matches) != 1:
+            raise WinCtlError(
+                f"legacy session bridge selector matched {len(matches)} windows; use an exact title",
+            )
+        title = str(matches[0].get("title") or "")
+    if not title:
+        raise WinCtlError("legacy session bridge requires a non-empty exact title")
+
+    monitor_index = int(target["monitor"])
+    monitor = next(
+        (item for item in state.get("monitors", []) if int(item.get("index", -1)) == monitor_index),
+        None,
+    )
+    if monitor is None:
+        raise WinCtlError(f"legacy session bridge cannot resolve monitor {monitor_index}")
+    geometry = target["geometry"]
+    placed = bool(_legacy_call(
+        "PlaceByTitle",
+        title,
+        str(int(target["workspace"])),
+        str(monitor_index),
+        str(int(monitor.get("x", 0)) + int(geometry["x"])),
+        str(int(monitor.get("y", 0)) + int(geometry["y"])),
+        str(int(geometry["width"])),
+        str(int(geometry["height"])),
+        "1" if target.get("state") in {"maximized", "fullscreen"} else "0",
+    ))
+    return {
+        "placed": placed,
+        "backend": "legacy-session-bridge",
+        "degraded": True,
+        "window": {"title": title},
+    }
 
 
 def expect_window(

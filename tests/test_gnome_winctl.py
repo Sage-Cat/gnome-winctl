@@ -7,7 +7,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gnome_winctl.cli import _geometry, _selector, main
-from gnome_winctl.client import _gdbus_value, add_monitor_identities, normalize_target
+from gnome_winctl.client import (
+    WinCtlError,
+    _gdbus_value,
+    add_monitor_identities,
+    get_capabilities,
+    get_state,
+    normalize_target,
+    place_window,
+)
 
 
 STATE = {
@@ -99,6 +107,64 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(state["monitors"][0]["identity"]["serial"], "ABC")
         self.assertEqual(state["monitors"][0]["identity"]["edid_hash"], "edid")
         self.assertEqual(state["windows"][0]["monitor_identity"]["product"], "LG HDR 4K")
+
+    def test_falls_back_to_live_legacy_session_service(self):
+        legacy = {
+            "active_workspace": 1,
+            "monitors": [dict(STATE["monitors"][0])],
+            "windows": [{
+                "pid": 42,
+                "title": "Terminal",
+                "wm_class": "Alacritty",
+                "workspace": 1,
+                "monitor": 0,
+                "geometry": {"x": 10, "y": 20, "width": 800, "height": 600},
+                "maximized": 0,
+            }],
+        }
+        with patch(
+            "gnome_winctl.client._json_call",
+            side_effect=WinCtlError("new service is not loaded"),
+        ), patch(
+            "gnome_winctl.client._legacy_json_call", return_value=legacy,
+        ), patch(
+            "gnome_winctl.client._workspace_names", return_value=["main", "research"],
+        ), patch(
+            "gnome_winctl.client._edid_hashes", return_value={},
+        ), patch(
+            "gnome_winctl.client._monitor_xml_identities", return_value={},
+        ):
+            state = get_state()
+            capabilities = get_capabilities()
+        self.assertEqual(state["backend"], "legacy-session-bridge")
+        self.assertEqual(state["workspaces"][1]["name"], "research")
+        self.assertEqual(state["windows"][0]["geometry_relative"]["x"], 10)
+        self.assertEqual(capabilities["capabilities"], [
+            "list_windows", "list_monitors", "list_workspaces", "place_window",
+        ])
+
+    def test_legacy_placement_converts_monitor_relative_geometry(self):
+        state = {
+            **STATE,
+            "backend": "legacy-session-bridge",
+            "windows": [{"pid": 42, "title": "Terminal", "app_ids": ["alacritty"]}],
+        }
+        state["monitors"] = [dict(STATE["monitors"][1])]
+        with patch("gnome_winctl.client.get_state", return_value=state), patch(
+            "gnome_winctl.client._json_call",
+            side_effect=WinCtlError("new service is not loaded"),
+        ), patch("gnome_winctl.client._legacy_call", return_value=True) as legacy:
+            result = place_window({"pid": 42}, {
+                "workspace": "research",
+                "monitor": "DP-1",
+                "geometry": {"x": 30, "y": 40, "width": 1200, "height": 900},
+                "coordinate_space": "monitor",
+                "state": "maximized",
+            })
+        self.assertTrue(result["placed"])
+        self.assertEqual(legacy.call_args.args, (
+            "PlaceByTitle", "Terminal", "1", "1", "1950", "40", "1200", "900", "1",
+        ))
 
 
 class CliTests(unittest.TestCase):

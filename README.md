@@ -33,6 +33,14 @@ Log out and back in after the first installation or an extension update when
 GNOME Shell has cached the previous module or extension metadata. Stay in the
 native Wayland session.
 
+During an in-place migration from the former wsctl Shell extension,
+`gnome-winctl` can use that already-loaded service as a session bridge. The
+bridge supports inspection and exact-title placement without restarting Shell;
+next-window reservations and exact Shell IDs become available when the new
+extension loads at the next normal login. `gnome-winctl status --json` reports
+`"backend":"legacy-session-bridge"` and its reduced capability list while this
+fallback is active.
+
 The runtime has no third-party Python dependencies. Development checks require
 Python 3.10 or newer and Node.js for JavaScript syntax validation.
 
