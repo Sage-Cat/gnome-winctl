@@ -1,0 +1,7 @@
+{
+  "uuid": "workspace-state@sagecat.local",
+  "name": "Workspace State Migration Stub",
+  "description": "Keeps an already-loaded placement bridge valid until the current session ends",
+  "shell-version": ["46"],
+  "version": 2
+}
