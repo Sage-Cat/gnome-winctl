@@ -2,8 +2,6 @@
   "uuid": "gnome-winctl@sagecat.local",
   "name": "GNOME Window Control",
   "description": "Versioned D-Bus placement service for native GNOME Wayland windows",
-  "shell-version": ["46", "47", "48", "49", "50"],
-  "version": 1,
-  "url": "https://github.com/Sage-Cat/gnome-winctl"
+  "shell-version": ["46"],
+  "version": 1
 }
-
