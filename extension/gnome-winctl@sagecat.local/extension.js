@@ -53,6 +53,8 @@ const CAPABILITIES = [
     'list_workspaces',
     'place_window',
     'expect_window',
+    'expectation_status',
+    'cancel_expectation',
     'window_state',
 ];
 
@@ -475,4 +477,3 @@ export default class GnomeWinCtlExtension extends Extension {
         return true;
     }
 }
-

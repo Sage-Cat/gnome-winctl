@@ -14,6 +14,7 @@ remain responsible for launching processes and restoring application state.
   or application ID, rejecting ambiguous selectors;
 - atomically apply workspace, monitor, logical geometry, and window state;
 - reserve placement for the next matching window before it is created;
+- query or cancel an outstanding placement reservation;
 - resolve workspace names and physical displays with EDID, connector, serial,
   model, index, and primary-monitor fallbacks;
 - emit JSON suitable for other tools.
@@ -76,4 +77,3 @@ The project was independently implemented against Mutter's window APIs. The
 Window Calls extension was used as a behavioral reference for the established
 pattern of exposing GNOME Shell window operations over the session bus; none of
 its GPL-licensed source is incorporated here.
-

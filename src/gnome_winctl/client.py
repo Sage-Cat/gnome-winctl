@@ -33,8 +33,13 @@ def _run(args: Iterable[str], *, timeout: float = 10) -> str:
 
 
 def _gdbus_value(output: str) -> Any:
+    raw = output.strip().rstrip(",")
+    if raw in {"(true,)", "(true)", "true"}:
+        return True
+    if raw in {"(false,)", "(false)", "false"}:
+        return False
     try:
-        value = ast.literal_eval(output.strip().rstrip(","))
+        value = ast.literal_eval(raw)
     except (SyntaxError, ValueError) as error:
         raise WinCtlError(f"invalid D-Bus response: {output!r}") from error
     return value[0] if isinstance(value, tuple) else value
@@ -209,10 +214,14 @@ def _monitor(spec: Any, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    monitor = _monitor(target.get("monitor", target.get("monitor_identity")), state)
-    workspace = _workspace_index(
-        target.get("workspace", target.get("workspace_name", 0)), state,
-    )
+    monitor = _monitor(target.get("monitor_identity") or target.get("monitor"), state)
+    workspace_spec: Any = target.get("workspace", 0)
+    if target.get("workspace_name"):
+        workspace_spec = {
+            "name": target["workspace_name"],
+            "index": target.get("workspace", 0),
+        }
+    workspace = _workspace_index(workspace_spec, state)
     geometry = dict(target.get("geometry") or {})
     if not geometry:
         geometry = {"x": 0, "y": 0, "width": 1000, "height": 700}
@@ -285,4 +294,3 @@ def wait_for_expectation(token: str, *, timeout: float = 20, interval: float = 0
             return last
         time.sleep(interval)
     return last
-

@@ -160,13 +160,12 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(result, dict):
         result.setdefault("ok", True)
     _print(result, as_json=as_json)
-    if isinstance(result, dict) and result.get("status") in {"failed", "expired", "cancelled", "unknown"}:
+    if args.command == "place" and isinstance(result, dict) and not result.get("placed"):
         return 1
-    if isinstance(result, dict) and result.get("placed") is False:
+    if args.command == "expect" and args.wait and isinstance(result, dict) and not result.get("placed"):
         return 1
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
