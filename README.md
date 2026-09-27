@@ -7,6 +7,16 @@ the command-line client exposes them to scripts and session managers.
 It deliberately manages placement only. Applications and higher-level tools
 remain responsible for launching processes and restoring application state.
 
+## Documentation and screenshots
+
+[Quick start and troubleshooting](docs/usage.md) · [Architecture](docs/architecture.md)
+
+![Window-control service diagnostics](docs/screenshots/diagnostics.png)
+
+This CLI capture shows the capabilities of the available GNOME service. It does
+not display application titles or saved session contents, and is not proof that a
+particular installed revision is loaded.
+
 ## Capabilities
 
 - list normal windows, logical monitors, and workspaces;
@@ -22,6 +32,15 @@ remain responsible for launching processes and restoring application state.
 - emit JSON suitable for other tools.
 
 Window IDs are intentionally session-local and must not be persisted.
+
+## Placement in action
+
+![Deferred request becomes verified in a disposable GNOME session](docs/screenshots/placement.png)
+
+A real synthetic window is moved to another monitor on an inactive workspace.
+The same request remains deferred until that workspace is activated, then becomes
+verified. Requested coordinates are monitor-relative; the verified window's
+geometry is global desktop geometry. [Reproduce the capture](docs/usage.md#placement-capture).
 
 ## Monitor intent and recovery
 

@@ -1,0 +1,29 @@
+@startuml
+!theme plain
+skinparam shadowing false
+skinparam componentStyle rectangle
+title GNOME Window Control: placement ownership
+actor "User / session manager" as user
+component "Python CLI + client\nselectors and target intent" as cli
+interface "Session D-Bus\nGnomeWinCtl1" as bus
+package "GNOME Shell extension" {
+  component "Request registry\ntokens, cancellation, bounded history" as requests
+  component "Window placement\napply and verify" as placement
+  component "Monitor policy\nphysical display anchors" as policy
+}
+component "Mutter / GNOME Shell\nwindows, workspaces, monitors" as shell
+user --> cli
+cli --> bus : inspect / place / expect / query
+bus --> requests
+requests --> placement : exact matched window + intent
+placement --> shell : compositor operations
+shell --> placement : geometry / mapping events
+placement --> requests : deferred / verified / failed
+shell --> policy : lock / topology / user movement
+policy --> placement : bounded recovery
+note bottom of requests
+Accepted is not verified.
+Inactive workspace placement may wait.
+Window IDs last only for this Shell session.
+end note
+@enduml
