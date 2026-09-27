@@ -64,7 +64,7 @@ def _target(args: argparse.Namespace) -> dict[str, Any]:
         monitor = int(monitor)
     return {
         "workspace": args.workspace,
-        "monitor": monitor or "primary",
+        "monitor": "primary" if monitor is None else monitor,
         "geometry": _geometry(args.geometry),
         "coordinate_space": "global" if args.global_coordinates else "monitor",
         "state": args.state,
@@ -105,6 +105,8 @@ def parser() -> argparse.ArgumentParser:
     place = commands.add_parser("place", help="place one existing window")
     _add_selector(place)
     _add_target(place)
+    place.add_argument("--wait", action="store_true", help="wait for verified placement; never activates its workspace")
+    place.add_argument("--timeout", type=float, default=20)
 
     expect = commands.add_parser("expect", help="place the next matching window")
     _add_selector(expect, expectation=True)
@@ -141,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
             result = get_state().get(args.command, [])
         elif args.command == "place":
             result = place_window(_selector(args), _target(args))
+            if args.wait and result.get("token"):
+                result = wait_for_expectation(result["token"], timeout=args.timeout)
         elif args.command == "expect":
             token = expect_window(_selector(args, expectation=True), _target(args), timeout=args.timeout)
             result = wait_for_expectation(token, timeout=args.timeout) if args.wait else {"token": token, "status": "pending"}
@@ -161,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         result.setdefault("ok", True)
     _print(result, as_json=as_json)
     if args.command == "place" and isinstance(result, dict) and not result.get("placed"):
-        return 1
+        if args.wait or result.get("status") not in {"accepted", "deferred", "applied"}:
+            return 1
     if args.command == "expect" and args.wait and isinstance(result, dict) and not result.get("placed"):
         return 1
     return 0

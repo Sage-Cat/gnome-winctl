@@ -164,7 +164,10 @@ def _edid_hashes() -> dict[str, str]:
             continue
         entry = path.parent.name
         connector = entry.split("-", 1)[1] if "-" in entry else entry
-        result[connector] = hashlib.sha256(raw).hexdigest()
+        checksum = hashlib.sha256(raw).hexdigest()
+        result[connector] = checksum
+        if connector.startswith("HDMI-A-"):
+            result[f"HDMI-{connector.removeprefix('HDMI-A-')}"] = checksum
     return result
 
 
@@ -294,40 +297,124 @@ def _workspace_index(spec: Any, state: dict[str, Any]) -> int:
 
 
 def _monitor_matches(identity: dict[str, Any], monitor: dict[str, Any]) -> bool:
-    current = monitor.get("identity") or {}
-    edid_hash = identity.get("edid_hash")
-    if edid_hash and current.get("edid_hash") == edid_hash:
-        return True
-    checksum = identity.get("edid_checksum")
-    if checksum and current.get("edid_checksum") == checksum:
-        return True
-    serial = identity.get("serial")
-    if serial and current.get("serial") == serial:
-        return True
-    connector = identity.get("connector")
-    return bool(
-        connector and current.get("connector") == connector
-        and (not identity.get("vendor") or current.get("vendor") == identity.get("vendor"))
-        and (not identity.get("product") or current.get("product") == identity.get("product"))
+    return monitor in _identity_candidates(identity, [monitor])
+
+
+def _unique_monitor(
+    candidates: list[dict[str, Any]],
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    if len(candidates) == 1:
+        return candidates[0]
+    connector = str(identity.get("connector") or "")
+    if connector:
+        connector_matches = [
+            item for item in candidates
+            if str((item.get("identity") or {}).get("connector") or "") == connector
+        ]
+        if len(connector_matches) == 1:
+            return connector_matches[0]
+    return None
+
+
+def _identity_candidates(
+    identity: dict[str, Any],
+    monitors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for field in ("edid_hash", "edid_checksum"):
+        value = str(identity.get(field) or "")
+        comparable = any((item.get("identity") or {}).get(field) for item in monitors)
+        if value and comparable:
+            return [
+                item for item in monitors
+                if str((item.get("identity") or {}).get(field) or "") == value
+            ]
+
+    serial = str(identity.get("serial") or "")
+    comparable_serial = any(
+        (item.get("identity") or {}).get("serial") for item in monitors
     )
+    if serial and comparable_serial:
+        return [
+            item for item in monitors
+            if str((item.get("identity") or {}).get("serial") or "") == serial
+            and (
+                not identity.get("vendor")
+                or (item.get("identity") or {}).get("vendor") == identity.get("vendor")
+            )
+            and (
+                not identity.get("product")
+                or (item.get("identity") or {}).get("product") == identity.get("product")
+            )
+        ]
+
+    connector = str(identity.get("connector") or "")
+    if connector:
+        return [
+            item for item in monitors
+            if str((item.get("identity") or {}).get("connector") or "") == connector
+            and (
+                not identity.get("vendor")
+                or (item.get("identity") or {}).get("vendor") == identity.get("vendor")
+            )
+            and (
+                not identity.get("product")
+                or (item.get("identity") or {}).get("product") == identity.get("product")
+            )
+        ]
+
+    vendor = str(identity.get("vendor") or "")
+    product = str(identity.get("product") or "")
+    if vendor or product:
+        return [
+            item for item in monitors
+            if (not vendor or (item.get("identity") or {}).get("vendor") == vendor)
+            and (not product or (item.get("identity") or {}).get("product") == product)
+        ]
+    return []
 
 
-def _monitor(spec: Any, state: dict[str, Any]) -> dict[str, Any]:
+def _resolve_monitor(spec: Any, state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     monitors = state.get("monitors", [])
     if not monitors:
         raise WinCtlError("GNOME reports no active monitors")
     primary = next((item for item in monitors if item.get("primary")), monitors[0])
     if spec in (None, "primary"):
-        return primary
+        return primary, True
     if isinstance(spec, int) or isinstance(spec, str) and spec.lstrip("-").isdigit():
         index = int(spec)
-        return next((item for item in monitors if int(item["index"]) == index), primary)
+        match = next((item for item in monitors if int(item["index"]) == index), None)
+        return (match, True) if match is not None else (primary, False)
     identity = dict(spec) if isinstance(spec, dict) else {"connector": str(spec)}
-    return next((item for item in monitors if _monitor_matches(identity, item)), primary)
+    match = _unique_monitor(_identity_candidates(identity, monitors), identity)
+    return (match, True) if match is not None else (primary, False)
+
+
+def _monitor(spec: Any, state: dict[str, Any]) -> dict[str, Any]:
+    return _resolve_monitor(spec, state)[0]
 
 
 def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    monitor = _monitor(target.get("monitor_identity") or target.get("monitor"), state)
+    raw_intent = target.get("monitor_intent") or target.get("monitor_identity")
+    monitor_spec = target.get("monitor")
+    if raw_intent:
+        intent = dict(raw_intent) if isinstance(raw_intent, dict) else {
+            "connector": str(raw_intent),
+        }
+        intent_monitor, intent_resolved = _resolve_monitor(intent, state)
+        if intent_resolved:
+            monitor = intent_monitor
+            intent.update(monitor.get("identity") or {})
+        else:
+            monitor, _monitor_resolved = _resolve_monitor(monitor_spec, state)
+    else:
+        monitor, intent_resolved = _resolve_monitor(monitor_spec, state)
+        if isinstance(monitor_spec, dict):
+            intent = dict(monitor_spec)
+        elif isinstance(monitor_spec, str) and monitor_spec != "primary" and not monitor_spec.lstrip("-").isdigit():
+            intent = {"connector": monitor_spec}
+        else:
+            intent = {}
     workspace_spec: Any = target.get("workspace", 0)
     if target.get("workspace_name"):
         workspace_spec = {
@@ -344,7 +431,7 @@ def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str,
         origin = old_monitor or monitor
         geometry["x"] = int(geometry.get("x", 0)) - int(origin.get("x", 0))
         geometry["y"] = int(geometry.get("y", 0)) - int(origin.get("y", 0))
-    return {
+    normalized = {
         "workspace": workspace,
         "monitor": int(monitor["index"]),
         "geometry": {
@@ -357,6 +444,10 @@ def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str,
         "state": str(target.get("state") or ("maximized" if target.get("maximized") else "normal")),
         "clamp": bool(target.get("clamp", True)),
     }
+    if intent:
+        normalized["monitor_intent"] = intent
+        normalized["monitor_intent_resolved"] = bool(intent_resolved)
+    return normalized
 
 
 def place_window(selector: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
@@ -383,27 +474,30 @@ def _legacy_place_window(
     state: dict[str, Any],
 ) -> dict[str, Any]:
     windows = state.get("windows", [])
-    if selector.get("title") is not None:
-        title = str(selector["title"])
-    else:
-        matches = []
-        for window in windows:
-            if selector.get("id") is not None and window.get("id") != selector["id"]:
+    if not any(selector.get(key) is not None for key in ("id", "pid", "title", "app_id")):
+        raise WinCtlError("selector has no supported window identity")
+    matches = []
+    for window in windows:
+        if selector.get("title") is not None and window.get("title", "") != str(selector["title"]):
+            continue
+        if selector.get("id") is not None and window.get("id") != selector["id"]:
+            continue
+        if selector.get("pid") is not None and int(window.get("pid", -1)) != int(selector["pid"]):
+            continue
+        if selector.get("app_id") is not None:
+            app_id = str(selector["app_id"]).strip().lower().removesuffix(".desktop")
+            if app_id not in window.get("app_ids", []):
                 continue
-            if selector.get("pid") is not None and int(window.get("pid", -1)) != int(selector["pid"]):
-                continue
-            if selector.get("app_id") is not None:
-                app_id = str(selector["app_id"]).lower().removesuffix(".desktop")
-                if app_id not in window.get("app_ids", []):
-                    continue
-            matches.append(window)
-        if len(matches) != 1:
-            raise WinCtlError(
-                f"legacy session bridge selector matched {len(matches)} windows; use an exact title",
-            )
-        title = str(matches[0].get("title") or "")
+        matches.append(window)
+    if len(matches) != 1:
+        raise WinCtlError(f"legacy session bridge selector matched {len(matches)} windows")
+    title = str(matches[0].get("title") or "")
     if not title:
         raise WinCtlError("legacy session bridge requires a non-empty exact title")
+    # The legacy D-Bus method receives only the title, so additional identity
+    # fields cannot disambiguate duplicate titles at the final placement step.
+    if sum(window.get("title") == title for window in windows) != 1:
+        raise WinCtlError("legacy session bridge requires a unique exact title")
 
     monitor_index = int(target["monitor"])
     monitor = next(
@@ -448,8 +542,8 @@ def expect_window(
     return str(token)
 
 
-def expectation_status(token: str) -> dict[str, Any]:
-    result = _json_call("ExpectationStatus", token)
+def expectation_status(token: str, *, timeout: float = 10) -> dict[str, Any]:
+    result = _json_call("ExpectationStatus", token, timeout=timeout)
     if not isinstance(result, dict):
         raise WinCtlError("ExpectationStatus did not return an object")
     return result
@@ -462,9 +556,15 @@ def cancel_expectation(token: str) -> bool:
 def wait_for_expectation(token: str, *, timeout: float = 20, interval: float = 0.05) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     last = {"token": token, "status": "pending"}
-    while time.monotonic() < deadline:
-        last = expectation_status(token)
-        if last.get("status") != "pending":
+    while (remaining := deadline - time.monotonic()) > 0:
+        last = expectation_status(token, timeout=min(10, remaining))
+        status = last.get("status")
+        if status == "placed" and last.get("deferred"):
+            last = {**last, "status": "deferred", "placed": False}
+            status = "deferred"
+        if status not in {"pending", "accepted", "deferred", "applied"} and not (
+            status == "placed" and last.get("deferred")
+        ):
             return last
-        time.sleep(interval)
-    return last
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
+    return {**last, "placed": False, "wait_timed_out": True}

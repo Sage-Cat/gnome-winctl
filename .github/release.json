@@ -1,0 +1,16 @@
+{
+  "name": "gnome-winctl",
+  "extensions": [
+    {
+      "directory": "extension/gnome-winctl-v3@sagecat.local",
+      "files": [
+        "metadata.json",
+        "extension.js",
+        "monitorPolicy.js",
+        "windowPlacement.js",
+        "placementRequests.js",
+        "buildInfo.js"
+      ]
+    }
+  ]
+}

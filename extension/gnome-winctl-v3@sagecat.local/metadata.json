@@ -1,0 +1,8 @@
+{
+  "uuid": "gnome-winctl-v3@sagecat.local",
+  "name": "GNOME Window Control",
+  "description": "Native Wayland placement and display-recovery service",
+  "shell-version": ["46"],
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 4
+}

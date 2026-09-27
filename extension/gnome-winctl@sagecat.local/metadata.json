@@ -1,7 +1,0 @@
-{
-  "uuid": "gnome-winctl@sagecat.local",
-  "name": "GNOME Window Control",
-  "description": "Versioned D-Bus placement service for native GNOME Wayland windows",
-  "shell-version": ["46"],
-  "version": 1
-}

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from gnome_winctl.cli import _geometry, _selector, main
 from gnome_winctl.client import (
     WinCtlError,
+    _edid_hashes,
     _gdbus_value,
     add_monitor_identities,
     get_capabilities,
@@ -58,6 +59,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(target["workspace"], 1)
         self.assertEqual(target["monitor"], 1)
         self.assertEqual(target["geometry"]["x"], 20)
+        self.assertEqual(target["monitor_intent"]["edid_hash"], "external")
+        self.assertTrue(target["monitor_intent_resolved"])
 
     def test_converts_legacy_global_geometry_to_monitor_relative(self):
         target = normalize_target({
@@ -80,6 +83,41 @@ class ClientTests(unittest.TestCase):
         }, STATE)
         self.assertEqual(target["workspace"], 1)
         self.assertEqual(target["monitor"], 1)
+        self.assertEqual(target["monitor_intent"]["connector"], "DP-1")
+        self.assertTrue(target["monitor_intent_resolved"])
+
+    def test_absent_monitor_uses_primary_without_erasing_intent(self):
+        target = normalize_target({
+            "workspace": 0,
+            "monitor": 0,
+            "monitor_intent": {"edid_hash": "absent", "connector": "DP-9"},
+            "geometry": {"x": 20, "y": 30, "width": 1000, "height": 700},
+            "coordinate_space": "monitor",
+        }, STATE)
+        self.assertEqual(target["monitor"], 0)
+        self.assertEqual(target["monitor_intent"]["edid_hash"], "absent")
+        self.assertFalse(target["monitor_intent_resolved"])
+
+    def test_ambiguous_identity_never_selects_the_first_monitor(self):
+        state = {
+            **STATE,
+            "monitors": [
+                {
+                    **STATE["monitors"][0],
+                    "identity": {"connector": "HDMI-1", "edid_hash": "same"},
+                },
+                {
+                    **STATE["monitors"][1],
+                    "identity": {"connector": "DP-1", "edid_hash": "same"},
+                },
+            ],
+        }
+        target = normalize_target({
+            "monitor": 0,
+            "monitor_intent": {"edid_hash": "same", "connector": "missing"},
+        }, state)
+        self.assertEqual(target["monitor"], 0)
+        self.assertFalse(target["monitor_intent_resolved"])
 
     def test_enriches_shell_monitor_with_persistent_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +145,15 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(state["monitors"][0]["identity"]["serial"], "ABC")
         self.assertEqual(state["monitors"][0]["identity"]["edid_hash"], "edid")
         self.assertEqual(state["windows"][0]["monitor_identity"]["product"], "LG HDR 4K")
+
+    def test_drm_hdmi_a_connector_hash_matches_mutters_hdmi_name(self):
+        fake = type("FakeEdid", (), {
+            "parent": type("Parent", (), {"name": "card1-HDMI-A-2"})(),
+            "read_bytes": lambda self: b"edid",
+        })()
+        with patch("gnome_winctl.client.Path.glob", return_value=[fake]):
+            hashes = _edid_hashes()
+        self.assertEqual(hashes["HDMI-A-2"], hashes["HDMI-2"])
 
     def test_falls_back_to_live_legacy_session_service(self):
         legacy = {
@@ -165,6 +212,32 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(legacy.call_args.args, (
             "PlaceByTitle", "Terminal", "1", "1", "1950", "40", "1200", "900", "1",
         ))
+
+    def test_legacy_title_selector_preserves_all_identity_constraints(self):
+        state = {**STATE, "backend": "legacy-session-bridge", "windows": [
+            {"id": 7, "pid": 42, "title": "Terminal", "app_ids": ["alacritty"]},
+        ]}
+        with patch("gnome_winctl.client.get_state", return_value=state), patch(
+            "gnome_winctl.client._json_call", side_effect=WinCtlError("legacy only"),
+        ), patch("gnome_winctl.client._legacy_call", return_value=True) as legacy:
+            for extra in ({"pid": 999}, {"id": 8}, {"app_id": "other-app"}):
+                with self.subTest(extra=extra), self.assertRaises(WinCtlError):
+                    place_window({"title": "Terminal", **extra}, {})
+            legacy.assert_not_called()
+            self.assertTrue(place_window({"title": "Terminal", "pid": 42, "app_id": "alacritty"}, {})["placed"])
+            legacy.assert_called_once()
+
+    def test_legacy_duplicate_titles_cannot_be_disambiguated_by_pid(self):
+        state = {**STATE, "backend": "legacy-session-bridge", "windows": [
+            {"pid": 42, "title": "Terminal"}, {"pid": 43, "title": "Terminal"},
+        ]}
+        with patch("gnome_winctl.client.get_state", return_value=state), patch(
+            "gnome_winctl.client._json_call", side_effect=WinCtlError("legacy only"),
+        ), patch("gnome_winctl.client._legacy_call") as legacy:
+            for selector in ({"title": "Terminal"}, {"pid": 42}, {"title": "Terminal", "pid": 42}):
+                with self.subTest(selector=selector), self.assertRaises(WinCtlError):
+                    place_window(selector, {})
+            legacy.assert_not_called()
 
 
 class CliTests(unittest.TestCase):
