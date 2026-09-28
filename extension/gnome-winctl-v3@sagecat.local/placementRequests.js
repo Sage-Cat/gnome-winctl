@@ -57,9 +57,13 @@ export class PlacementRequests {
 export function placementVerified(window, target, tolerance = 3) {
     if (window.workspace !== target.workspace || window.monitor !== target.monitor || window.state !== target.state)
         return false;
-    if (target.state === 'maximized' || target.state === 'fullscreen')
-        return true;
+    // Maximize/fullscreen flags can change before the client acknowledges the
+    // new size. Verify the current work area/monitor frame, not its saved
+    // normal rectangle and not just the state flag.
+    const geometry = target.state === 'maximized' || target.state === 'fullscreen'
+        ? target.verification_geometry
+        : target.geometry;
     return ['x', 'y', 'width', 'height'].every(key =>
-        Number.isFinite(window.geometry?.[key]) &&
-        Math.abs(window.geometry[key] - target.geometry[key]) <= tolerance);
+        Number.isFinite(window.geometry?.[key]) && Number.isFinite(geometry?.[key]) &&
+        Math.abs(window.geometry[key] - geometry[key]) <= tolerance);
 }

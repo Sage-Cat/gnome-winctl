@@ -1449,6 +1449,7 @@ export default class GnomeWinCtlExtension extends Extension {
         const rect = window.get_frame_rect();
         const monitorIndex = window.get_monitor();
         const monitor = monitors.find(item => item.index === monitorIndex) ?? null;
+        const area = window.get_workspace()?.get_work_area_for_monitor(monitorIndex);
         return {
             id: window.get_stable_sequence(),
             pid: window.get_pid(),
@@ -1460,6 +1461,9 @@ export default class GnomeWinCtlExtension extends Extension {
             workspace: window.get_workspace()?.index() ?? 0,
             monitor: monitorIndex,
             monitor_geometry: monitor,
+            monitor_work_area: area
+                ? {x: area.x, y: area.y, width: area.width, height: area.height}
+                : null,
             geometry: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
             geometry_relative: {
                 x: rect.x - (monitor?.x ?? 0),
@@ -1593,6 +1597,9 @@ export default class GnomeWinCtlExtension extends Extension {
         const state = ['normal', 'maximized', 'fullscreen', 'minimized'].includes(target.state)
             ? target.state
             : 'normal';
+        const verificationArea = state === 'maximized'
+            ? global.workspace_manager.get_workspace_by_index(workspaceIndex).get_work_area_for_monitor(monitor.index)
+            : state === 'fullscreen' ? monitor : null;
         const liveAnchor = captureMonitorAnchor(monitor);
         const intendedAnchor = requestedIntent
             ? intentMonitor && anchorHasPhysicalIdentity(liveAnchor)
@@ -1605,6 +1612,10 @@ export default class GnomeWinCtlExtension extends Extension {
             monitor_intent: intendedAnchor,
             monitor_intent_resolved: !requestedIntent || Boolean(intentMonitor),
             geometry: {x, y, width, height},
+            ...(verificationArea ? {verification_geometry: {
+                x: verificationArea.x, y: verificationArea.y,
+                width: verificationArea.width, height: verificationArea.height,
+            }} : {}),
             state,
         };
     }
@@ -1630,7 +1641,7 @@ export default class GnomeWinCtlExtension extends Extension {
                 const fresh = this._resolvedTarget(request.target);
                 const sameTarget = fresh.monitor_intent_resolved && fresh.monitor === resolved.monitor &&
                     ['x', 'y', 'width', 'height'].every(key => fresh.geometry[key] === resolved.geometry[key]);
-                if (sameTarget && placementVerified(current, resolved)) {
+                if (sameTarget && placementVerified(current, fresh)) {
                     this._requests.update(token, 'verified', {window: current, deferred: false});
                 } else if (++attempts < 20 && this._enableEpoch === epoch) {
                     return GLib.SOURCE_CONTINUE;
@@ -1679,12 +1690,14 @@ export default class GnomeWinCtlExtension extends Extension {
                     record.requestToken = token;
                 if (!screenUnavailable && window.get_workspace() !== workspace)
                     window.change_workspace(workspace);
-                deferred = screenUnavailable || placementNeedsActiveWorkspace(window, global.workspace_manager, workspace);
+                const alreadyPlaced = placementVerified(this._windowRecord(window), resolved);
+                deferred = screenUnavailable || (
+                    placementNeedsActiveWorkspace(window, global.workspace_manager, workspace) && !alreadyPlaced);
                 if (deferred) {
                     if (!record)
                         throw new Error('cannot defer placement for an untracked window');
                     record.deferredPlacement = {token, target: intent};
-                } else {
+                } else if (!alreadyPlaced) {
                     this._applyResolvedPlacement(window, resolved);
                 }
             } finally {

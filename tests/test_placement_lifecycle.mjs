@@ -10,7 +10,8 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
     let clock = 0;
     const timers = new Map();
     let next = 0;
-    const workspaces = [{index: () => 0}, {index: () => 1}];
+    const workspaces = [0, 1].map(index => ({index: () => index,
+        get_work_area_for_monitor: monitor => ({x: monitor * 1000, y: 30, width: 1000, height: 970})}));
     let active = workspaces[0];
     const manager = {n_workspaces: 2, get_workspace_by_index: index => workspaces[index], get_active_workspace: () => active};
     const GLib = {
@@ -256,10 +257,51 @@ test('a compositor that accepts calls without applying geometry never produces v
     assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'failed');
 });
 
-test('maximized and fullscreen verification uses state rather than obsolete normal geometry', () => {
+test('maximized and fullscreen verification uses current area rather than obsolete normal geometry', () => {
     for (const state of ['maximized', 'fullscreen']) {
+        const area = {x: 0, y: 0, width: 900, height: 900};
+        const target = {workspace: 1, monitor: 0, state,
+            geometry: {x: 20, y: 30, width: 100, height: 100}, verification_geometry: area};
         assert.equal(requests.placementVerified(
-            {workspace: 1, monitor: 0, state, geometry: {x: 0, y: 0, width: 900, height: 900}},
-            {workspace: 1, monitor: 0, state, geometry: {x: 20, y: 30, width: 100, height: 100}}), true);
+            {workspace: 1, monitor: 0, state, geometry: area}, target), true);
+        assert.equal(requests.placementVerified(
+            {workspace: 1, monitor: 0, state, geometry: {...area, width: 3840, height: 2030}}, target), false);
     }
+});
+
+test('a settled off-workspace handoff verifies without another compositor resize or activation', () => {
+    const f = fixture();
+    f.window.monitor = 1;
+    f.window.state = 'maximized';
+    f.window.geometry = {x: 1000, y: 30, width: 1000, height: 970};
+    let resized = false;
+    f.extension._applyResolvedPlacement = () => { resized = true; };
+    const result = f.extension._applyPlacement(f.window, {...target, state: 'maximized'});
+    assert.equal(result.status, 'applied');
+    assert.equal(result.deferred, false);
+    assert.equal(resized, false);
+    assert.equal(f.extension._monitorRecords.get(f.window).deferredPlacement, null);
+    f.tick();
+    assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'verified');
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('an inactive maximized window with its previous monitor size stays deferred', () => {
+    const f = fixture();
+    f.window.monitor = 1;
+    f.window.state = 'maximized';
+    f.window.geometry = {x: 1000, y: 30, width: 2000, height: 1970};
+    const result = f.extension._applyPlacement(f.window, {...target, state: 'maximized'});
+    assert.equal(result.status, 'deferred');
+    assert.equal(result.placed, false);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('work area and fullscreen frame are resolved independently from saved normal geometry', () => {
+    const f = fixture();
+    const maximized = f.extension._resolvedTarget({...target, state: 'maximized'});
+    const fullscreen = f.extension._resolvedTarget({...target, state: 'fullscreen'});
+    assert.equal(JSON.stringify(maximized.verification_geometry), JSON.stringify({x: 1000, y: 30, width: 1000, height: 970}));
+    assert.equal(JSON.stringify(fullscreen.verification_geometry), JSON.stringify({x: 1000, y: 0, width: 1000, height: 1000}));
+    assert.equal(maximized.geometry.width, 200);
 });
