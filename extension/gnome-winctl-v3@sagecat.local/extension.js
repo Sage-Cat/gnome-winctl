@@ -1078,11 +1078,11 @@ export default class GnomeWinCtlExtension extends Extension {
         const geometry = resolved.geometry;
         const frame = window.get_frame_rect();
         if (windowIsOnActiveWorkspace(window, global.workspace_manager) &&
-            (frame.width !== geometry.width || frame.height !== geometry.height)) {
-            // An occluded Wayland client can withhold its resized buffer.
-            // Expose it for this explicit resize without changing keyboard
-            // focus or activating another workspace. Position-only moves and
-            // already verified placements retain their stacking order.
+            (['x', 'y', 'width', 'height'].some(key => frame[key] !== geometry[key]) ||
+                resolved.state === 'maximized')) {
+            // Covered clients may withhold a pending configure even when only
+            // position differs now. Expose the explicit placement without
+            // changing focus or activating another workspace.
             window.raise();
         }
         window.move_resize_frame(
@@ -1092,12 +1092,16 @@ export default class GnomeWinCtlExtension extends Extension {
             geometry.width,
             geometry.height,
         );
+        // Unmaximize and maximize in one turn can leave a Wayland client on
+        // its previous monitor's frame. The owned verifier completes this
+        // transition after the normal frame has stopped changing.
         if (resolved.state === 'maximized')
-            window.maximize(Meta.MaximizeFlags.BOTH);
-        else if (resolved.state === 'fullscreen')
+            return true;
+        if (resolved.state === 'fullscreen')
             window.make_fullscreen();
         else if (resolved.state === 'minimized')
             window.minimize();
+        return false;
     }
 
     _applyDeferredPlacement(window, record, reason) {
@@ -1634,9 +1638,19 @@ export default class GnomeWinCtlExtension extends Extension {
         return result;
     }
 
-    _verifyPlacement(window, token, resolved) {
+    _sameResolvedPlacement(left, right) {
+        return left.monitor_intent_resolved && right.monitor_intent_resolved &&
+            ['workspace', 'monitor', 'state'].every(key => left[key] === right[key]) &&
+            ['geometry', 'verification_geometry'].every(field =>
+                ['x', 'y', 'width', 'height'].every(key => left[field]?.[key] === right[field]?.[key]));
+    }
+
+    _verifyPlacement(window, token, resolved, settleNormal = false) {
         const epoch = this._enableEpoch;
+        const deadline = GLib.get_monotonic_time() + 4000000;
         let attempts = 0;
+        let normalFrame = null;
+        let normalSince = null;
         const source = this._timeout(GLib.PRIORITY_DEFAULT, 100, () => {
             const request = this._requests.get(token);
             if (request.status !== 'applied') {
@@ -1644,15 +1658,40 @@ export default class GnomeWinCtlExtension extends Extension {
                 return GLib.SOURCE_REMOVE;
             }
             try {
+                if (GLib.get_monotonic_time() >= deadline)
+                    throw new Error('placement verification deadline elapsed');
                 const current = this._windowRecord(window);
                 // A topology change between apply and verification cannot
                 // turn an old numeric index into proof of the intended display.
                 const fresh = this._resolvedTarget(request.target);
-                const sameTarget = fresh.monitor_intent_resolved && fresh.monitor === resolved.monitor &&
-                    ['x', 'y', 'width', 'height'].every(key => fresh.geometry[key] === resolved.geometry[key]);
+                const sameTarget = this._sameResolvedPlacement(fresh, resolved);
+                if (settleNormal) {
+                    if (!sameTarget || this._enableEpoch !== epoch || this._screenUnavailable() ||
+                        !windowIsOnActiveWorkspace(window, global.workspace_manager) ||
+                        this._monitorRecords.get(window)?.requestToken !== token)
+                        throw new Error('maximize preparation lost its current placement ownership');
+                    const frame = current.geometry;
+                    const normal = current.state === 'normal' && current.workspace === resolved.workspace &&
+                        current.monitor === resolved.monitor &&
+                        ['x', 'y', 'width', 'height'].every(key => Number.isFinite(frame?.[key])) &&
+                        frame.width > 0 && frame.height > 0;
+                    if (!normal) {
+                        normalFrame = null;
+                        normalSince = null;
+                    } else if (!normalFrame || ['x', 'y', 'width', 'height'].some(key => normalFrame[key] !== frame[key])) {
+                        normalFrame = {...frame};
+                        normalSince = GLib.get_monotonic_time();
+                    } else if (GLib.get_monotonic_time() - normalSince >= 400000) {
+                        // Normal windows may have size increments or limits.
+                        // Observe their settled frame; only the final maximized
+                        // frame must equal the current compositor work area.
+                        window.maximize(Meta.MaximizeFlags.BOTH);
+                        settleNormal = false;
+                    }
+                }
                 if (sameTarget && placementVerified(current, fresh)) {
                     this._requests.update(token, 'verified', {window: current, deferred: false});
-                } else if (++attempts < 20 && this._enableEpoch === epoch) {
+                } else if (++attempts < 40 && this._enableEpoch === epoch) {
                     return GLib.SOURCE_CONTINUE;
                 } else {
                     this._requests.update(token, 'failed', {message: 'placement did not verify against the current desktop'});
@@ -1667,6 +1706,7 @@ export default class GnomeWinCtlExtension extends Extension {
     }
 
     _applyPlacement(window, target, token = null) {
+        const directRequest = token === null;
         if (token === null) {
             token = GLib.uuid_string_random();
             this._requests.create(token, target, null);
@@ -1690,10 +1730,20 @@ export default class GnomeWinCtlExtension extends Extension {
                 coordinate_space: 'monitor', geometry: {...resolved.geometry,
                     x: resolved.geometry.x - monitor.x, y: resolved.geometry.y - monitor.y}};
             const previous = this._monitorRecords.get(window)?.requestToken;
+            if (directRequest && previous && previous !== token) {
+                const owned = this._requests.get(previous);
+                if (owned.status === 'applied' && GLib.get_monotonic_time() - owned.updated_at < 4000000 &&
+                    owned.resolved_target && this._sameResolvedPlacement(owned.resolved_target, resolved) &&
+                    this._sameResolvedPlacement(this._resolvedTarget(owned.target), resolved)) {
+                    this._requests.update(token, 'cancelled', {message: 'identical in-flight placement reused'});
+                    return this._requestResult(previous);
+                }
+            }
             if (previous && previous !== token)
                 this._requests.update(previous, 'cancelled', {message: 'superseded by a newer explicit placement'});
             const record = this._beginExplicitPlacement(window, resolved.monitor_intent);
             let deferred = false;
+            let settleNormal = false;
             try {
                 if (record)
                     record.requestToken = token;
@@ -1707,7 +1757,7 @@ export default class GnomeWinCtlExtension extends Extension {
                         throw new Error('cannot defer placement for an untracked window');
                     record.deferredPlacement = {token, target: intent};
                 } else if (!alreadyPlaced) {
-                    this._applyResolvedPlacement(window, resolved);
+                    settleNormal = this._applyResolvedPlacement(window, resolved) === true;
                 }
             } finally {
                 this._endExplicitPlacement(window, record);
@@ -1716,7 +1766,7 @@ export default class GnomeWinCtlExtension extends Extension {
                 deferred, target: intent, resolved_target: resolved, window: this._windowRecord(window),
             });
             if (!deferred)
-                this._verifyPlacement(window, token, resolved);
+                this._verifyPlacement(window, token, resolved, settleNormal);
         } catch (error) {
             this._requests.update(token, 'failed', {message: error.message});
             const record = this._monitorRecords.get(window);

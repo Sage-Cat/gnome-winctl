@@ -34,10 +34,15 @@ without moving the window to an unrelated fallback. Recovery is move-bounded and
 retry circuit breaker. `gnome-winctl state` reports the policy state under
 `monitor_policy`.
 
-An explicit resize on the active workspace raises the window before requesting
-its new frame. This lets covered Wayland clients finish resizing without taking
-keyboard focus. Position-only moves and already verified placements preserve
-stacking order; placement never activates another workspace.
+An explicit frame change on the active workspace raises the window so covered
+Wayland clients can finish pending moves and resizes. It does not take keyboard
+focus. Already verified placements preserve stacking order; placement never
+activates another workspace.
+
+Maximizing waits for the normal frame to settle for 400 ms before applying the
+maximized state. Final verification uses the current monitor work area. Each
+request has a four-second verification limit. Repeating an identical in-flight
+request reuses its token; a changed target or desktop topology starts a new one.
 
 ## D-Bus API
 

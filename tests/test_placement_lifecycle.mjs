@@ -78,10 +78,10 @@ function coveredClient() {
         raise() { exposed = true; raises++; },
         activate() { assert.fail('placement must not activate the client'); },
         move_resize_frame(_userOp, x, y, width, height) {
-            // Reproduce a covered Wayland client withholding its new buffer.
-            this.geometry = {...this.geometry, x, y};
+            // A pending configure may hold position as well as size until the
+            // covered client produces a new buffer.
             if (exposed)
-                Object.assign(this.geometry, {width, height});
+                Object.assign(this.geometry, {x, y, width, height});
         },
     });
     f.extension._applyResolvedPlacement = Object.getPrototypeOf(f.extension)._applyResolvedPlacement;
@@ -102,7 +102,7 @@ test('covered client finishes an explicit resize and inactive handoff without ta
     assert.equal(f.manager.get_active_workspace().index(), 0);
 });
 
-test('position-only and already verified placement preserve stacking', () => {
+test('position-only placement exposes a pending client but a verified no-op does not restack it', () => {
     const f = coveredClient();
     const sameSize = {...target, workspace: 0, geometry: {...target.geometry, width: 100}};
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -110,7 +110,7 @@ test('position-only and already verified placement preserve stacking', () => {
         f.tick();
         assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'verified');
     }
-    assert.equal(f.raises(), 0);
+    assert.equal(f.raises(), 1);
     assert.equal(f.display.focus_window, f.focus);
 });
 
@@ -313,7 +313,7 @@ test('a compositor that accepts calls without applying geometry never produces v
     const result = f.extension._applyPlacement(f.window, {...target, workspace: 0});
     assert.equal(result.status, 'applied');
     assert.equal(result.placed, false);
-    for (let attempt = 0; attempt < 20; attempt++) f.tick();
+    for (let attempt = 0; attempt < 40; attempt++) f.tick();
     assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'failed');
 });
 
@@ -364,4 +364,140 @@ test('work area and fullscreen frame are resolved independently from saved norma
     assert.equal(JSON.stringify(maximized.verification_geometry), JSON.stringify({x: 1000, y: 30, width: 1000, height: 970}));
     assert.equal(JSON.stringify(fullscreen.verification_geometry), JSON.stringify({x: 1000, y: 0, width: 1000, height: 1000}));
     assert.equal(maximized.geometry.width, 200);
+});
+
+function maximizingClient() {
+    const f = coveredClient();
+    let maximizes = 0;
+    Object.assign(f.window, {
+        state: 'maximized',
+        unmaximize() { this.state = 'normal'; },
+        move_resize_frame(_userOp, x, y) {
+            // Size increments/limits make the requested normal size inexact.
+            this.geometry = {x, y, width: 317, height: 291};
+        },
+        maximize() {
+            maximizes++;
+            this.state = 'maximized';
+            this.geometry = {x: this.monitor * 1000, y: 30, width: 1000, height: 970};
+        },
+    });
+    return {...f, maximizes: () => maximizes,
+        tickAfter: amount => { f.advance(amount); f.tick(); }};
+}
+
+const maximizedTarget = {...target, workspace: 0, state: 'maximized'};
+
+test('maximize waits for a settled normal frame without demanding impossible normal dimensions', () => {
+    const f = maximizingClient();
+    const result = f.extension._applyPlacement(f.window, maximizedTarget);
+    assert.equal(result.status, 'applied');
+    assert.equal(f.maximizes(), 0, 'never unmaximize and remaximize in one turn');
+    for (let i = 0; i < 4; i++) f.tickAfter(100000);
+    assert.equal(f.maximizes(), 0);
+    f.tickAfter(100000);
+    assert.equal(f.maximizes(), 1);
+    f.tickAfter(100000);
+    assert.equal(f.extension._requests.get(result.token).status, 'verified');
+    assert.equal(f.display.focus_window, f.focus);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('a changing normal frame resets the maximize stability interval', () => {
+    const f = maximizingClient();
+    f.extension._applyPlacement(f.window, maximizedTarget);
+    for (let i = 0; i < 4; i++) f.tickAfter(100000);
+    f.window.geometry.width++;
+    f.tickAfter(100000);
+    for (let i = 0; i < 3; i++) f.tickAfter(100000);
+    assert.equal(f.maximizes(), 0);
+    f.tickAfter(100000);
+    assert.equal(f.maximizes(), 1);
+});
+
+test('identical in-flight placements reuse ownership instead of restarting preparation', () => {
+    const f = maximizingClient();
+    const first = f.extension._applyPlacement(f.window, maximizedTarget);
+    for (let i = 0; i < 4; i++) f.tickAfter(100000);
+    const second = f.extension._applyPlacement(f.window, {...maximizedTarget});
+    assert.equal(second.token, first.token);
+    assert.equal(f.raises(), 1);
+    f.tickAfter(100000);
+    assert.equal(f.maximizes(), 1);
+    f.tickAfter(100000);
+    assert.equal(f.extension._requests.get(first.token).status, 'verified');
+});
+
+test('cancel, lock, workspace, ownership, topology and epoch changes prevent delayed maximize', () => {
+    for (const change of ['cancel', 'lock', 'workspace', 'owner', 'topology', 'epoch']) {
+        const f = maximizingClient();
+        const first = f.extension._applyPlacement(f.window, maximizedTarget);
+        f.tickAfter(100000);
+        if (change === 'cancel') f.extension.CancelExpectation(first.token);
+        if (change === 'lock') f.extension._screenUnavailable = () => true;
+        if (change === 'workspace') f.activate(1);
+        if (change === 'owner') f.extension._monitorRecords.get(f.window).requestToken = 'another-request';
+        if (change === 'topology') f.setMonitors([{index: 0, primary: true, x: 0, y: 0, width: 1000, height: 1000, serial: 'A'}]);
+        if (change === 'epoch') f.extension._enableEpoch = 'epoch-two';
+        for (let i = 0; i < 8; i++) f.tickAfter(100000);
+        assert.equal(f.maximizes(), 0, change);
+        assert.notEqual(f.extension._requests.get(first.token).status, 'verified', change);
+    }
+});
+
+test('a normal frame that never settles fails within the original bounded request', () => {
+    const f = maximizingClient();
+    const first = f.extension._applyPlacement(f.window, maximizedTarget);
+    for (let i = 0; i < 40; i++) {
+        f.window.geometry.width++;
+        f.tickAfter(100000);
+    }
+    assert.equal(f.maximizes(), 0);
+    assert.equal(f.extension._requests.get(first.token).status, 'failed');
+    assert.equal(f.timers.size, 0);
+});
+
+test('deduplication never reuses a request bound to stale topology or an expired verifier', () => {
+    for (const change of ['topology', 'deadline']) {
+        const f = maximizingClient();
+        const first = f.extension._applyPlacement(f.window, maximizedTarget);
+        if (change === 'topology') {
+            f.setMonitors([{index: 0, primary: true, x: 0, y: 0, width: 1000, height: 1000, serial: 'B'},
+                {index: 1, x: 1000, y: 0, width: 1000, height: 1000, serial: 'A'}]);
+        } else {
+            f.advance(4100000); // No callback has run yet.
+        }
+        const second = f.extension._applyPlacement(f.window, first.target);
+        assert.notEqual(second.token, first.token, change);
+        assert.equal(f.extension._requests.get(first.token).status, 'cancelled', change);
+        assert.equal(f.raises(), 2, change);
+    }
+});
+
+test('a delayed callback cannot maximize after its wall-clock deadline', () => {
+    const f = maximizingClient();
+    const first = f.extension._applyPlacement(f.window, maximizedTarget);
+    f.tickAfter(100000);
+    f.tickAfter(4100000);
+    assert.equal(f.maximizes(), 0);
+    assert.equal(f.extension._requests.get(first.token).status, 'failed');
+    assert.equal(f.timers.size, 0);
+});
+
+test('a public reservation keeps its own completion and cancellation handle', () => {
+    for (const cancel of [false, true]) {
+        const f = maximizingClient();
+        f.extension._matches = () => true;
+        const reserved = f.extension.ExpectWindow('{"app_id":"app"}', JSON.stringify(maximizedTarget), 20000);
+        const direct = f.extension._applyPlacement(f.window, maximizedTarget);
+        f.extension._windowCreated(f.window);
+        f.tickAfter(100000);
+        assert.equal(f.extension._requests.get(direct.token).status, 'cancelled');
+        assert.equal(f.extension._requests.get(reserved).status, 'applied');
+        assert.equal(f.extension._monitorRecords.get(f.window).requestToken, reserved);
+        if (cancel) f.extension.CancelExpectation(reserved);
+        for (let i = 0; i < 7; i++) f.tickAfter(100000);
+        assert.equal(f.extension._requests.get(reserved).status, cancel ? 'cancelled' : 'verified');
+        assert.equal(f.maximizes(), cancel ? 0 : 1);
+    }
 });
