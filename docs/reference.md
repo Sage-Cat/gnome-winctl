@@ -34,6 +34,11 @@ without moving the window to an unrelated fallback. Recovery is move-bounded and
 retry circuit breaker. `gnome-winctl state` reports the policy state under
 `monitor_policy`.
 
+An explicit resize on the active workspace raises the window before requesting
+its new frame. This lets covered Wayland clients finish resizing without taking
+keyboard focus. Position-only moves and already verified placements preserve
+stacking order; placement never activates another workspace.
+
 ## D-Bus API
 
 The extension owns `org.sagecat.GnomeWinCtl1` at

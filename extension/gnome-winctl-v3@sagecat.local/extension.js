@@ -1076,6 +1076,15 @@ export default class GnomeWinCtlExtension extends Extension {
         window.unmaximize(Meta.MaximizeFlags.BOTH);
         window.move_to_monitor(resolved.monitor);
         const geometry = resolved.geometry;
+        const frame = window.get_frame_rect();
+        if (windowIsOnActiveWorkspace(window, global.workspace_manager) &&
+            (frame.width !== geometry.width || frame.height !== geometry.height)) {
+            // An occluded Wayland client can withhold its resized buffer.
+            // Expose it for this explicit resize without changing keyboard
+            // focus or activating another workspace. Position-only moves and
+            // already verified placements retain their stacking order.
+            window.raise();
+        }
         window.move_resize_frame(
             true,
             geometry.x,

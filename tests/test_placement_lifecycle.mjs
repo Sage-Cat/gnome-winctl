@@ -65,6 +65,66 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
 
 const target = {workspace: 1, monitor: 1, geometry: {x: 20, y: 30, width: 200, height: 100}, clamp: false};
 
+function coveredClient() {
+    const focus = {id: 'other-application'};
+    const display = {focus_window: focus};
+    const f = fixture({display, Meta: {MaximizeFlags: {BOTH: 3}}});
+    let exposed = false;
+    let raises = 0;
+    Object.assign(f.window, {
+        unminimize() {}, is_fullscreen: () => false, unmaximize() {},
+        get_frame_rect() { return {...this.geometry}; },
+        move_to_monitor(monitor) { this.monitor = monitor; },
+        raise() { exposed = true; raises++; },
+        activate() { assert.fail('placement must not activate the client'); },
+        move_resize_frame(_userOp, x, y, width, height) {
+            // Reproduce a covered Wayland client withholding its new buffer.
+            this.geometry = {...this.geometry, x, y};
+            if (exposed)
+                Object.assign(this.geometry, {width, height});
+        },
+    });
+    f.extension._applyResolvedPlacement = Object.getPrototypeOf(f.extension)._applyResolvedPlacement;
+    return {...f, display, focus, raises: () => raises};
+}
+
+test('covered client finishes an explicit resize and inactive handoff without taking focus', () => {
+    const f = coveredClient();
+    const staged = f.extension._applyPlacement(f.window, {...target, workspace: 0});
+    f.tick();
+    assert.equal(JSON.parse(f.extension.ExpectationStatus(staged.token)).status, 'verified');
+    assert.equal(f.raises(), 1);
+    const final = f.extension._applyPlacement(f.window, target);
+    f.tick();
+    assert.equal(JSON.parse(f.extension.ExpectationStatus(final.token)).status, 'verified');
+    assert.equal(f.raises(), 1, 'settled handoff must not restack the window again');
+    assert.equal(f.display.focus_window, f.focus);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('position-only and already verified placement preserve stacking', () => {
+    const f = coveredClient();
+    const sameSize = {...target, workspace: 0, geometry: {...target.geometry, width: 100}};
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const result = f.extension._applyPlacement(f.window, sameSize);
+        f.tick();
+        assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'verified');
+    }
+    assert.equal(f.raises(), 0);
+    assert.equal(f.display.focus_window, f.focus);
+});
+
+test('inactive or locked placement cannot expose a covered client', () => {
+    for (const locked of [false, true]) {
+        const f = coveredClient();
+        f.extension._screenUnavailable = () => locked;
+        const result = f.extension._applyPlacement(f.window, {...target, workspace: locked ? 0 : 1});
+        assert.equal(result.status, 'deferred');
+        assert.equal(f.raises(), 0);
+        assert.equal(f.display.focus_window, f.focus);
+    }
+});
+
 test('deferred placement remains owned, resolves reordered physical monitor, and verifies after replay', () => {
     const f = fixture();
     const result = f.extension._applyPlacement(f.window, target);
