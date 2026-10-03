@@ -1,52 +1,31 @@
 # gnome-winctl
 
-Move and inspect windows in a native GNOME Wayland session from the command line.
-A GNOME Shell extension performs the window operations; a Python client exposes them to scripts.
-
-- List windows, monitors and workspaces.
-- Place an existing window or reserve placement for a new one.
-- Verify placement and track requests deferred on inactive workspaces.
-- Recover a window's intended display after lock, wake or monitor changes.
-
-It manages placement. Your application or session manager must launch programs
-and restore their contents. Window IDs are valid only for the current Shell session.
+Inspect, place and recover windows in native GNOME Wayland using a Shell extension
+and Python CLI. Applications and session managers handle launching and contents.
 
 ![A placement request changes from deferred to verified](docs/screenshots/placement.png)
 
-This capture uses a real disposable GNOME session and a synthetic window.
-Placement becomes verified after its workspace is activated. Request coordinates
-are monitor-relative; the resulting window geometry uses global coordinates.
+Real disposable GNOME session with a synthetic window; [capture details](docs/usage.md#placement-capture).
 
-## Install
+## Setup and use
 
-Requires GNOME Shell 46 on Wayland, Python 3.10+, `gdbus`, and
-`gnome-extensions`. Development checks also require Node.js.
+Requires GNOME Shell 46 on Wayland, Python 3.10+, `gdbus`, `gnome-extensions`,
+and Node.js for tests.
 
 ```sh
-make test
+make test  # Python/Node regression tests and JavaScript syntax checks
 make install
 gnome-extensions enable gnome-winctl-v3@sagecat.local
-```
-
-Log out and back in if Shell has cached the previous extension. The standalone
-installer links the CLI to this checkout, so keep the checkout in place.
-
-## Usage
-
-```sh
 gnome-winctl status --json
 gnome-winctl windows --json
-gnome-winctl monitors --json
-gnome-winctl workspaces --json
-
 # Replace 42 with an ID from the current window list.
 gnome-winctl place 42 --workspace 1 --monitor 0 \
   --geometry 30,40,1200,800 --state normal --wait
 ```
 
-Workspace and monitor indices start at zero. Without `--wait`, success can mean
-accepted rather than verified. Deferred placement does not switch workspaces.
-Window inventories may contain private titles; review them before sharing.
+Keep this checkout: the standalone installer links its CLI. Use the next normal
+login if Shell has cached an older extension. Window IDs last only this Shell
+session; indices start at zero. `--wait` requires verified placement.
 
 ## Documentation
 
@@ -54,3 +33,4 @@ Window inventories may contain private titles; review them before sharing.
 - [Architecture and source map](docs/architecture.md) · [PlantUML source](docs/architecture.puml)
 - [Placement and recovery reference](docs/reference.md) · [D-Bus contract](dbus/org.sagecat.GnomeWinCtl1.xml)
 - [Releases](https://github.com/Sage-Cat/gnome-winctl/releases) · [Publication process](https://github.com/Sage-Cat/workspace-state/blob/main/docs/publication.md)
+- [Full desktop lifecycle validation](https://github.com/Sage-Cat/desktop-workspace/blob/main/docs/validation.md) documents integration tests and their limits, not VM coverage of every feature.
