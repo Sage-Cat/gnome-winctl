@@ -40,6 +40,14 @@ STATE = {
 
 
 class ClientTests(unittest.TestCase):
+    def test_staged_handoff_requires_capability_and_preserves_the_opt_in(self):
+        with self.assertRaisesRegex(WinCtlError, "owned staged placement"):
+            normalize_target({'stage_before_handoff': True}, STATE)
+        target = normalize_target({'stage_before_handoff': True},
+                                  dict(STATE, capabilities=['staged_placement_handoff']))
+        self.assertTrue(target['stage_before_handoff'])
+        self.assertNotIn('stage_before_handoff', normalize_target({}, STATE))
+
     def test_parses_gdbus_single_value_tuple(self):
         payload = json.dumps({"available": True})
         self.assertEqual(_gdbus_value(repr((payload,))), payload)

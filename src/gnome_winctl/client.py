@@ -444,6 +444,10 @@ def normalize_target(target: dict[str, Any], state: dict[str, Any]) -> dict[str,
         "state": str(target.get("state") or ("maximized" if target.get("maximized") else "normal")),
         "clamp": bool(target.get("clamp", True)),
     }
+    if target.get("stage_before_handoff") is True:
+        if "staged_placement_handoff" not in state.get("capabilities", []):
+            raise WinCtlError("GNOME does not support an owned staged placement handoff")
+        normalized["stage_before_handoff"] = True
     if intent:
         normalized["monitor_intent"] = intent
         normalized["monitor_intent_resolved"] = bool(intent_resolved)

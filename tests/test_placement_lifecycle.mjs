@@ -52,7 +52,8 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
     };
     extension._endExplicitPlacement = () => {};
     extension._applyResolvedPlacement = (value, target) => { value.monitor = target.monitor; value.geometry = target.geometry; value.state = target.state; };
-    function tick() {
+    function tick(elapsed = 100000) {
+        clock += elapsed;
         for (const [id, callback] of [...timers]) {
             if (callback() === false) timers.delete(id);
         }
@@ -383,10 +384,120 @@ function maximizingClient() {
         },
     });
     return {...f, maximizes: () => maximizes,
-        tickAfter: amount => { f.advance(amount); f.tick(); }};
+        tickAfter: amount => { f.advance(amount); f.tick(0); }};
 }
 
 const maximizedTarget = {...target, workspace: 0, state: 'maximized'};
+
+test('one owned request stages then verifies only the final inactive destination', () => {
+    const f = coveredClient();
+    const result = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    assert.equal(result.handoff_owned, true);
+    assert.equal(result.resolved_target.workspace, 1);
+    assert.equal(f.window.workspace.index(), 0);
+    f.tick();
+    assert.equal(f.window.workspace.index(), 0, 'normal frame must remain stable before handoff');
+    for (let i = 0; i < 4; i++) f.tick();
+    assert.equal(f.extension._requests.get(result.token).status, 'applied');
+    assert.equal(f.window.workspace.index(), 1);
+    f.tick();
+    assert.equal(f.extension._requests.get(result.token).status, 'verified');
+    assert.equal(f.display.focus_window, f.focus);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('normal, minimized, maximized and fullscreen states reach the final destination through one receipt', () => {
+    for (const state of ['normal', 'minimized', 'maximized', 'fullscreen']) {
+        const f = fixture();
+        const applied = [];
+        f.extension._applyResolvedPlacement = (window, destination) => {
+            applied.push({...destination});
+            Object.assign(window, {monitor: destination.monitor, state: destination.state,
+                geometry: destination.verification_geometry || destination.geometry});
+        };
+        f.window.minimize = function () { this.state = 'minimized'; };
+        const result = f.extension._applyPlacement(f.window, {...target, state, stage_before_handoff: true});
+        assert.equal(result.handoff_owned, true);
+        for (let i = 0; i < 8; i++) f.tick();
+        assert.equal(f.extension._requests.get(result.token).status, 'verified', state);
+        assert.equal(f.window.state, state);
+        assert.equal(f.window.workspace.index(), 1);
+        assert.equal(f.manager.get_active_workspace().index(), 0);
+        assert.equal(applied.length, 1, 'the settled final handoff does not request another resize');
+    }
+});
+
+test('locked handoff keeps the final target without moving or exposing a window', () => {
+    const f = coveredClient();
+    f.window.change_workspace(f.manager.get_workspace_by_index(1));
+    f.extension._screenUnavailable = () => true;
+    const result = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    assert.equal(result.status, 'deferred');
+    assert.equal(result.handoff_owned, true);
+    assert.equal(f.window.monitor, 0);
+    assert.equal(f.raises(), 0);
+    const record = f.extension._monitorRecords.get(f.window);
+    assert.equal(f.extension._applyDeferredPlacement(f.window, record, 'still-locked'), false);
+    f.extension._screenUnavailable = () => false;
+    assert.equal(f.extension._applyDeferredPlacement(f.window, record, 'unlocked'), true);
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(result.token).status, 'verified');
+    assert.equal(f.window.workspace.index(), 1);
+    assert.equal(f.window.monitor, 1);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('lock between configure and handoff resumes the same final receipt after hours', () => {
+    const f = maximizingClient();
+    const result = f.extension._applyPlacement(f.window, {...target, state: 'maximized', stage_before_handoff: true});
+    f.tickAfter(100000);
+    f.extension._screenUnavailable = () => true;
+    f.tickAfter(100000);
+    assert.equal(f.extension._requests.get(result.token).status, 'deferred');
+    assert.equal(f.maximizes(), 0);
+    f.advance(4 * 60 * 60 * 1000000);
+    assert.equal(f.extension._requests.get(result.token).status, 'deferred');
+    f.extension._screenUnavailable = () => false;
+    f.extension._applyDeferredPlacement(f.window, f.extension._monitorRecords.get(f.window), 'unlocked');
+    for (let i = 0; i < 8; i++) f.tickAfter(100000);
+    assert.equal(f.extension._requests.get(result.token).status, 'verified');
+    assert.equal(f.window.workspace.index(), 1);
+    assert.equal(f.window.monitor, 1);
+    assert.equal(f.maximizes(), 1);
+});
+
+test('cancelled or superseded locked handoff cannot replay after unlock', () => {
+    for (const cancel of [true, false]) {
+        const f = coveredClient();
+        f.extension._screenUnavailable = () => true;
+        const first = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+        const oldRecord = {...f.extension._monitorRecords.get(f.window)};
+        if (cancel) f.extension.CancelExpectation(first.token);
+        else f.extension._applyPlacement(f.window, {...target, workspace: 0, monitor: 0, stage_before_handoff: true});
+        f.extension._screenUnavailable = () => false;
+        assert.equal(f.extension._applyDeferredPlacement(f.window, oldRecord, 'unlocked'), false);
+        assert.equal(f.extension._requests.get(first.token).status, 'cancelled');
+        assert.equal(f.raises(), 0);
+    }
+});
+
+test('concurrent handoffs serialize active resizing and retain queued final targets', () => {
+    const f = fixture();
+    const secondWindow = {...f.window, geometry: {...f.window.geometry}};
+    const first = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    const second = f.extension._applyPlacement(secondWindow, {...target, stage_before_handoff: true});
+    assert.equal(second.status, 'deferred');
+    assert.equal(secondWindow.monitor, 0);
+    const retry = f.extension._applyPlacement(secondWindow, {...target, stage_before_handoff: true});
+    assert.equal(retry.token, second.token, 'queued retries keep the original observable receipt');
+    f.tick();
+    assert.equal(secondWindow.monitor, 0, 'the first final handoff still owns active staging');
+    for (let i = 0; i < 14; i++) f.tick();
+    for (const token of [first.token, second.token])
+        assert.equal(f.extension._requests.get(token).status, 'verified');
+    assert.equal(secondWindow.workspace.index(), 1);
+    assert.equal(secondWindow.monitor, 1);
+});
 
 test('maximize waits for a settled normal frame without demanding impossible normal dimensions', () => {
     const f = maximizingClient();
@@ -426,6 +537,21 @@ test('identical in-flight placements reuse ownership instead of restarting prepa
     assert.equal(f.maximizes(), 1);
     f.tickAfter(100000);
     assert.equal(f.extension._requests.get(first.token).status, 'verified');
+});
+
+test('a final handoff upgrades an unowned placement and survives ordinary supervisor retries', () => {
+    const f = fixture();
+    const legacy = f.extension._applyPlacement(f.window, target);
+    assert.notEqual(legacy.handoff_owned, true);
+    const owned = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    assert.notEqual(owned.token, legacy.token);
+    assert.equal(owned.handoff_owned, true);
+    assert.equal(f.extension._requests.get(legacy.token).status, 'cancelled');
+    const retry = f.extension._applyPlacement(f.window, target);
+    assert.equal(retry.token, owned.token);
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(owned.token).status, 'verified');
+    assert.equal(f.window.workspace.index(), target.workspace);
 });
 
 test('cancel, lock, workspace, ownership, topology and epoch changes prevent delayed maximize', () => {
@@ -500,4 +626,184 @@ test('a public reservation keeps its own completion and cancellation handle', ()
         assert.equal(f.extension._requests.get(reserved).status, cancel ? 'cancelled' : 'verified');
         assert.equal(f.maximizes(), cancel ? 0 : 1);
     }
+});
+
+
+function unmappedClient() {
+    const f = fixture();
+    const signals = new Map();
+    let sequence = 0;
+    f.window.geometry = {x: 0, y: 0, width: 0, height: 0};
+    f.window.connect = (name, callback) => { const id = ++sequence; signals.set(id, {name, callback}); return id; };
+    f.window.disconnect = id => signals.delete(id);
+    const map = () => {
+        // First size signal precedes Mutter's default initial cascade position.
+        f.window.geometry = {x: 0, y: 0, width: 800, height: 635};
+        for (const signal of [...signals.values()])
+            if (signal.name === 'size-changed') signal.callback();
+        Object.assign(f.window.geometry, {x: 166, y: 132});
+    };
+    return {...f, signals, map};
+}
+
+test('a zero-size new window retains its final receipt until initial placement finishes', () => {
+    const f = unmappedClient();
+    const saved = {...target, workspace: 0, monitor: 0,
+        geometry: {x: 116, y: 82, width: 800, height: 635}, stage_before_handoff: true};
+    const pending = f.extension._applyPlacement(f.window, saved);
+    assert.equal(pending.status, 'deferred');
+    assert.equal(pending.handoff_owned, true);
+    assert.equal(f.window.geometry.width, 0, 'a surface without a frame is never configured');
+    f.advance(3600000000);
+    f.tick();
+    assert.equal(f.extension._requests.get(pending.token).status, 'deferred');
+    f.map();
+    assert.equal(f.window.geometry.x, 166, 'initial placement completes before the owned move');
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(pending.token).status, 'verified');
+    assert.deepEqual({...f.window.geometry}, saved.geometry);
+    assert.equal(f.signals.size, 0);
+});
+
+test('an unmapped window does not block another window from finishing the native queue', () => {
+    const f = unmappedClient();
+    const mapped = {...f.window, geometry: {x: 10, y: 20, width: 500, height: 300}};
+    const waiting = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    const ready = f.extension._applyPlacement(mapped, {...target, stage_before_handoff: true});
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(waiting.token).status, 'deferred');
+    assert.equal(f.extension._requests.get(ready.token).status, 'verified');
+    f.map();
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(waiting.token).status, 'verified');
+});
+
+test('initial-frame readiness preserves screen-lock and cancellation authority', () => {
+    for (const change of ['lock', 'cancel', 'unmanage']) {
+        const f = unmappedClient();
+        const waiting = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+        if (change === 'lock') f.extension._screenUnavailable = () => true;
+        if (change === 'cancel') f.extension.CancelExpectation(waiting.token);
+        f.map();
+        if (change === 'unmanage') f.extension._untrackWindow(f.window);
+        if (change === 'lock') f.advance(3600000000);
+        for (let i = 0; i < 8; i++) f.tick();
+        assert.equal(f.window.geometry.x, 166, change);
+        assert.equal(f.signals.size, 0, change);
+        assert.equal(f.extension._requests.get(waiting.token).status,
+            change === 'lock' ? 'deferred' : change === 'cancel' ? 'cancelled' : 'failed');
+        if (change === 'lock') {
+            f.extension._screenUnavailable = () => false;
+            f.extension._resumeStagedHandoff();
+            for (let i = 0; i < 8; i++) f.tick();
+            assert.equal(f.extension._requests.get(waiting.token).status, 'verified');
+        }
+    }
+});
+
+test('a new final request supersedes an unmapped request without reviving its receipt', () => {
+    const f = unmappedClient();
+    const first = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    const changed = {...target, workspace: 0, geometry: {...target.geometry, x: 90}, stage_before_handoff: true};
+    const second = f.extension._applyPlacement(f.window, changed);
+    assert.notEqual(first.token, second.token);
+    assert.equal(f.signals.size, 1);
+    f.map();
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(first.token).status, 'cancelled');
+    assert.equal(f.extension._requests.get(second.token).status, 'verified');
+    assert.equal(f.window.geometry.x, 1090);
+    assert.equal(f.window.workspace.index(), 0);
+});
+
+function latePositionClient() {
+    const f = coveredClient();
+    let destination;
+    let resizes = 0;
+    let moves = 0;
+    f.window.move_resize_frame = function (_userOp, x, y, width, height) {
+        resizes++;
+        destination = {x, y, width, height};
+    };
+    f.window.move_frame = function (_userOp, x, y) {
+        moves++;
+        Object.assign(this.geometry, {x, y});
+    };
+    const acknowledgeSize = () => { f.window.geometry = {...destination,
+        x: destination.x + 25, y: destination.y + 29}; };
+    return {...f, acknowledgeSize, resizes: () => resizes, moves: () => moves};
+}
+
+test('late client position is corrected once after size acknowledgement and verified before handoff', () => {
+    const f = latePositionClient();
+    const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    for (let i = 0; i < 3; i++) f.tick();
+    assert.equal(f.moves(), 0, 'position correction must wait for the resize acknowledgement');
+    f.acknowledgeSize();
+    f.tick();
+    assert.equal(f.moves(), 1);
+    assert.equal(f.resizes(), 1, 'position correction never restarts the resize handshake');
+    assert.equal(f.window.workspace.index(), 0);
+    for (let i = 0; i < 4; i++) f.tick();
+    assert.equal(f.window.workspace.index(), 0, 'exact geometry must settle before inactive handoff');
+    f.tick();
+    assert.equal(f.window.workspace.index(), 1);
+    f.tick();
+    assert.equal(f.extension._requests.get(receipt.token).status, 'verified');
+    assert.equal(f.resizes(), 1);
+    assert.equal(f.moves(), 1);
+    assert.equal(f.display.focus_window, f.focus);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
+test('normal position instability never produces success or repeated corrections', () => {
+    const f = latePositionClient();
+    const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    f.acknowledgeSize();
+    f.tick();
+    for (let i = 0; i < 40; i++) {
+        f.window.geometry.x = i % 2 ? 1045 : 1020;
+        f.tick();
+    }
+    assert.equal(f.extension._requests.get(receipt.token).status, 'failed');
+    assert.equal(f.moves(), 1);
+    assert.equal(f.resizes(), 1);
+    assert.equal(f.window.workspace.index(), 0);
+});
+
+test('normal correction respects cancellation, grabs, topology, epoch and the original deadline', () => {
+    for (const change of ['cancel', 'grab', 'overview', 'owner', 'topology', 'epoch', 'deadline', 'lock']) {
+        const f = latePositionClient();
+        const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+        f.acknowledgeSize();
+        if (change === 'cancel') f.extension.CancelExpectation(receipt.token);
+        if (change === 'grab') f.extension._monitorRecords.get(f.window).grabActive = true;
+        if (change === 'overview') f.extension._monitorRecords.get(f.window).overviewDrag = true;
+        if (change === 'owner') f.extension._monitorRecords.get(f.window).requestToken = 'new-owner';
+        if (change === 'topology') f.setMonitors([{index: 0, primary: true, x: 0, y: 0, width: 1000, height: 1000, serial: 'A'}]);
+        if (change === 'epoch') f.extension._enableEpoch = 'epoch-two';
+        if (change === 'deadline') f.advance(4100000);
+        if (change === 'lock') f.extension._screenUnavailable = () => true;
+        f.tick();
+        assert.equal(f.moves(), 0, change);
+        assert.equal(f.resizes(), 1, change);
+        assert.notEqual(f.extension._requests.get(receipt.token).status, 'verified', change);
+        assert.equal(f.window.workspace.index(), 0, change);
+    }
+});
+
+test('workspace activation during configure rejoins the native queue with the same final intent', () => {
+    const f = latePositionClient();
+    const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+    f.activate(1);
+    f.tick();
+    assert.equal(f.extension._monitorRecords.get(f.window).requestToken, receipt.token);
+    assert.equal(f.extension._requests.get(receipt.token).status, 'applied');
+    assert.equal(f.window.workspace.index(), 1);
+    f.acknowledgeSize();
+    for (let i = 0; i < 8; i++) f.tick();
+    assert.equal(f.extension._requests.get(receipt.token).status, 'verified');
+    assert.equal(f.extension._requests.get(receipt.token).target.workspace, 1);
+    assert.equal(f.display.focus_window, f.focus);
+    assert.equal(f.manager.get_active_workspace().index(), 1);
 });

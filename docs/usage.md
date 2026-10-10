@@ -60,6 +60,20 @@ gnome-winctl expectation TOKEN --json
 Cancel a pending request with `gnome-winctl cancel TOKEN`. Cancellation does not
 undo a placement already applied.
 
+Restore clients that require an inactive-workspace handoff can submit a JSON
+`--target-json` with `stage_before_handoff: true`. This requires the advertised
+`staged_placement_handoff` capability. GNOME keeps the complete final target and
+returns `handoff_owned: true` with its receipt. It queues active resize work,
+waits for a new window's first nonzero frame, then verifies the saved monitor,
+workspace, geometry and state. For a normal window, it observes the size
+acknowledgement, corrects a late position offset at most once without issuing
+another resize, and requires a stable frame before handoff. A workspace switch
+during staging returns the same final intent to the queue on the active workspace;
+GNOME does not activate workspaces. The request stays pending across screen locking
+without moving or exposing the client behind the lock. The same token resumes
+after unlock; caller timeouts do not discard or recreate its final destination.
+Clients should observe that token and cancel it explicitly if no longer wanted.
+
 ## Reserve placement for a new window
 
 Before launching an application, register a reservation with `expect`. Use an

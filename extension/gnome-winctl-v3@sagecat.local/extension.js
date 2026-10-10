@@ -87,6 +87,7 @@ const CAPABILITIES = [
     'monitor_intent',
     'monitor_recovery',
     'placement_lifecycle_v2',
+    'staged_placement_handoff',
     'runtime_build',
 ];
 
@@ -774,13 +775,15 @@ export default class GnomeWinCtlExtension extends Extension {
             this._requests.update(record.requestToken, 'failed', {message: 'window was unmanaged before placement completed'});
         for (const field of [
             'settleSource', 'restoreSource', 'pendingSource', 'restoringSource',
-            'placementSource', 'commitSource',
+            'placementSource', 'commitSource', 'initialFrameSource',
         ])
             this._cancelRecordSource(record, field);
         if (record.monitorSignal)
             window.disconnect(record.monitorSignal);
         if (record.unmanagedSignal)
             window.disconnect(record.unmanagedSignal);
+        if (record.initialFrameSignal)
+            window.disconnect(record.initialFrameSignal);
         this._monitorRecords.delete(window);
     }
 
@@ -906,7 +909,8 @@ export default class GnomeWinCtlExtension extends Extension {
                 if (record.placementIntent === intendedAnchor) {
                     record.placementIntent = null;
                     const target = monitorForAnchor(record.anchor, this._monitors());
-                    if (target && window.get_monitor() !== target.index &&
+                    if (target && (window.get_monitor() !== target.index ||
+                        record.deferredPlacement?.target.stage_before_handoff) &&
                         !this._screenUnavailable() &&
                         windowIsOnActiveWorkspace(window, global.workspace_manager)) {
                         this._beginRecovery('post-placement-verification');
@@ -1036,7 +1040,8 @@ export default class GnomeWinCtlExtension extends Extension {
         let missing = 0;
         let skipped = 0;
         for (const [window, record] of this._monitorRecords) {
-            if (!windowIsOnActiveWorkspace(window, global.workspace_manager))
+            if (!windowIsOnActiveWorkspace(window, global.workspace_manager) &&
+                !record.deferredPlacement?.target.stage_before_handoff)
                 continue;
             if (!record.workspaceRecoveryPending && !record.deferredPlacement)
                 continue;
@@ -1106,7 +1111,9 @@ export default class GnomeWinCtlExtension extends Extension {
 
     _applyDeferredPlacement(window, record, reason) {
         const deferred = record.deferredPlacement;
-        if (!deferred || !windowIsOnActiveWorkspace(window, global.workspace_manager))
+        if (!deferred || record.initialFramePending || this._screenUnavailable() ||
+            (!windowIsOnActiveWorkspace(window, global.workspace_manager) &&
+                !deferred.target.stage_before_handoff))
             return false;
         const request = this._requests.get(deferred.token);
         if (request.status !== 'deferred') {
@@ -1133,6 +1140,15 @@ export default class GnomeWinCtlExtension extends Extension {
     }
 
     _onScreenShieldChanged(signal) {
+        if (this._screenUnavailable()) {
+            for (const [window, record] of this._monitorRecords ?? []) {
+                const request = this._requests.get(record.requestToken);
+                if (request.status === 'applied' && request.target?.stage_before_handoff) {
+                    record.deferredPlacement = {token: request.token, target: request.target};
+                    this._requests.update(request.token, 'deferred', {deferred: true});
+                }
+            }
+        }
         this._beginRecovery(`screen:${signal}`);
         if (signal === 'wake-up-screen' && this._recovery)
             this._recovery.wakeRequested = true;
@@ -1216,7 +1232,8 @@ export default class GnomeWinCtlExtension extends Extension {
         let skipped = 0;
         let deferredInactive = 0;
         for (const [window, record] of this._monitorRecords) {
-            if (!windowIsOnActiveWorkspace(window, global.workspace_manager)) {
+            if (!windowIsOnActiveWorkspace(window, global.workspace_manager) &&
+                !record.deferredPlacement?.target.stage_before_handoff) {
                 record.workspaceRecoveryPending = true;
                 const inactiveTarget = monitorForAnchor(record.anchor, monitors);
                 if (record.deferredPlacement || inactiveTarget)
@@ -1645,25 +1662,106 @@ export default class GnomeWinCtlExtension extends Extension {
                 ['x', 'y', 'width', 'height'].every(key => left[field]?.[key] === right[field]?.[key]));
     }
 
-    _verifyPlacement(window, token, resolved, settleNormal = false) {
+    _handoffInFlight(exceptToken = null) {
+        return [...this._requests.records.values()].some(request => request.token !== exceptToken &&
+            request.status === 'applied' && request.target.stage_before_handoff);
+    }
+
+    _awaitInitialFrame(window, record) {
+        if (record?.initialFramePending)
+            return true;
+        const frame = this._windowRecord(window).geometry;
+        if (Number.isFinite(frame?.width) && frame.width > 0 &&
+            Number.isFinite(frame?.height) && frame.height > 0)
+            return false;
+        if (!record)
+            throw new Error('cannot retain placement before the initial window frame');
+        record.initialFramePending = true;
+        record.initialFrameSignal = window.connect('size-changed', () => {
+            const current = this._windowRecord(window).geometry;
+            if (!(current.width > 0 && current.height > 0) || record.initialFrameSource)
+                return;
+            // Let Mutter finish the initial configure/placement event before
+            // moving the new window. A 0x0 surface has no frame to configure;
+            // its first default placement would overwrite an earlier request.
+            record.initialFrameSource = this._timeout(GLib.PRIORITY_DEFAULT, 0, () => {
+                record.initialFrameSource = 0;
+                if (this._monitorRecords.get(window) !== record)
+                    return GLib.SOURCE_REMOVE;
+                const ready = this._windowRecord(window).geometry;
+                if (!(ready.width > 0 && ready.height > 0))
+                    return GLib.SOURCE_REMOVE;
+                record.initialFramePending = false;
+                window.disconnect(record.initialFrameSignal);
+                record.initialFrameSignal = 0;
+                this._applyDeferredPlacement(window, record, 'initial-frame-ready');
+                return GLib.SOURCE_REMOVE;
+            });
+        });
+        return true;
+    }
+
+    _resumeStagedHandoff() {
+        if (this._screenUnavailable() || this._handoffInFlight())
+            return;
+        for (const [window, record] of this._monitorRecords) {
+            if (record.deferredPlacement?.target.stage_before_handoff &&
+                !record.grabActive && !record.overviewDrag &&
+                this._applyDeferredPlacement(window, record, 'previous-handoff-settled'))
+                break;
+        }
+    }
+
+    _verifyPlacement(window, token, resolved, settleNormal = false, handoff = null) {
         const epoch = this._enableEpoch;
         const deadline = GLib.get_monotonic_time() + 4000000;
         let attempts = 0;
         let normalFrame = null;
         let normalSince = null;
+        let positionCorrected = false;
         const source = this._timeout(GLib.PRIORITY_DEFAULT, 100, () => {
             const request = this._requests.get(token);
             if (request.status !== 'applied') {
                 this._retrySources.delete(source);
+                this._resumeStagedHandoff();
                 return GLib.SOURCE_REMOVE;
             }
             try {
+                // A staged request owns its final destination, including when
+                // the screen locks between its configure and workspace handoff.
+                // Retain that request without changing anything behind the lock.
+                if (request.target.stage_before_handoff && this._screenUnavailable()) {
+                    const record = this._monitorRecords.get(window);
+                    if (record?.requestToken !== token)
+                        throw new Error('staged placement lost its current ownership');
+                    record.deferredPlacement = {token, target: request.target};
+                    this._requests.update(token, 'deferred', {deferred: true});
+                    this._retrySources.delete(source);
+                    return GLib.SOURCE_REMOVE;
+                }
+                const record = this._monitorRecords.get(window);
+                if (handoff) {
+                    if (record?.requestToken !== token || record.grabActive || record.overviewDrag)
+                        throw new Error('staged placement lost its current ownership');
+                    if (!windowIsOnActiveWorkspace(window, global.workspace_manager)) {
+                        // Application identification or the user can switch
+                        // workspaces during a configure. Retain the final intent
+                        // and rejoin the native queue on the newly active one.
+                        record.deferredPlacement = {token, target: request.target};
+                        this._requests.update(token, 'deferred', {deferred: true});
+                        this._retrySources.delete(source);
+                        this._resumeStagedHandoff();
+                        return GLib.SOURCE_REMOVE;
+                    }
+                }
                 if (GLib.get_monotonic_time() >= deadline)
                     throw new Error('placement verification deadline elapsed');
                 const current = this._windowRecord(window);
                 // A topology change between apply and verification cannot
                 // turn an old numeric index into proof of the intended display.
-                const fresh = this._resolvedTarget(request.target);
+                const fresh = this._resolvedTarget(handoff
+                    ? {...request.target, workspace: resolved.workspace, state: resolved.state}
+                    : request.target);
                 const sameTarget = this._sameResolvedPlacement(fresh, resolved);
                 if (settleNormal) {
                     if (!sameTarget || this._enableEpoch !== epoch || this._screenUnavailable() ||
@@ -1689,7 +1787,51 @@ export default class GnomeWinCtlExtension extends Extension {
                         settleNormal = false;
                     }
                 }
+                if (handoff && resolved.state === 'normal') {
+                    if (!sameTarget || this._enableEpoch !== epoch)
+                        throw new Error('normal preparation lost its current placement ownership');
+                    const frame = current.geometry;
+                    const sizeAcknowledged = current.state === 'normal' &&
+                        current.workspace === resolved.workspace && current.monitor === resolved.monitor &&
+                        ['width', 'height'].every(key => Number.isFinite(frame?.[key]) &&
+                            Math.abs(frame[key] - resolved.geometry[key]) <= 3);
+                    const positionAcknowledged = ['x', 'y'].every(key => Number.isFinite(frame?.[key]) &&
+                        Math.abs(frame[key] - resolved.geometry[key]) <= 3);
+                    if (sizeAcknowledged && !positionAcknowledged && !positionCorrected) {
+                        // The client can acknowledge the new size with a late
+                        // initial/CSD position. Correct only position once;
+                        // issuing another resize would restart that handshake.
+                        window.move_frame(true, resolved.geometry.x, resolved.geometry.y);
+                        positionCorrected = true;
+                        normalFrame = null;
+                        normalSince = null;
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                    if (!placementVerified(current, fresh)) {
+                        normalFrame = null;
+                        normalSince = null;
+                    } else if (!normalFrame || ['x', 'y', 'width', 'height'].some(key => normalFrame[key] !== frame[key])) {
+                        normalFrame = {...frame};
+                        normalSince = GLib.get_monotonic_time();
+                        return GLib.SOURCE_CONTINUE;
+                    } else if (GLib.get_monotonic_time() - normalSince < 400000) {
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                }
                 if (sameTarget && placementVerified(current, fresh)) {
+                    if (handoff) {
+                        // Minimize while mapped, then hand off the already
+                        // acknowledged frame. Never activate a workspace.
+                        if (handoff.state === 'minimized' && resolved.state !== 'minimized') {
+                            const minimized = {...resolved, state: 'minimized'};
+                            window.minimize();
+                            this._verifyPlacement(window, token, minimized, false, handoff);
+                        } else {
+                            this._applyPlacement(window, handoff, token, false);
+                        }
+                        this._retrySources.delete(source);
+                        return GLib.SOURCE_REMOVE;
+                    }
                     this._requests.update(token, 'verified', {window: current, deferred: false});
                 } else if (++attempts < 40 && this._enableEpoch === epoch) {
                     return GLib.SOURCE_CONTINUE;
@@ -1700,12 +1842,13 @@ export default class GnomeWinCtlExtension extends Extension {
                 this._requests.update(token, 'failed', {message: error.message});
             }
             this._retrySources.delete(source);
+            this._resumeStagedHandoff();
             return GLib.SOURCE_REMOVE;
         });
         this._retrySources.add(source);
     }
 
-    _applyPlacement(window, target, token = null) {
+    _applyPlacement(window, target, token = null, allowStaging = true) {
         const directRequest = token === null;
         if (token === null) {
             token = GLib.uuid_string_random();
@@ -1721,7 +1864,8 @@ export default class GnomeWinCtlExtension extends Extension {
                 throw new Error('requested physical monitor is unavailable or ambiguous');
             const workspace = global.workspace_manager.get_workspace_by_index(resolved.workspace);
             const screenUnavailable = this._screenUnavailable();
-            if (screenUnavailable && window.get_workspace() !== workspace)
+            const stagedHandoff = target.stage_before_handoff === true;
+            if (screenUnavailable && window.get_workspace() !== workspace && !stagedHandoff)
                 throw new Error('screen is locked and the window is on another workspace');
             // Freeze the physical intent and monitor-relative rectangle, not
             // the temporary monitor index or absolute desktop coordinates.
@@ -1732,7 +1876,9 @@ export default class GnomeWinCtlExtension extends Extension {
             const previous = this._monitorRecords.get(window)?.requestToken;
             if (directRequest && previous && previous !== token) {
                 const owned = this._requests.get(previous);
-                if (owned.status === 'applied' && GLib.get_monotonic_time() - owned.updated_at < 4000000 &&
+                if ((owned.status === 'deferred' ||
+                    owned.status === 'applied' && GLib.get_monotonic_time() - owned.updated_at < 4000000) &&
+                    (!stagedHandoff || owned.handoff_owned === true) &&
                     owned.resolved_target && this._sameResolvedPlacement(owned.resolved_target, resolved) &&
                     this._sameResolvedPlacement(this._resolvedTarget(owned.target), resolved)) {
                     this._requests.update(token, 'cancelled', {message: 'identical in-flight placement reused'});
@@ -1744,29 +1890,42 @@ export default class GnomeWinCtlExtension extends Extension {
             const record = this._beginExplicitPlacement(window, resolved.monitor_intent);
             let deferred = false;
             let settleNormal = false;
+            let appliedTarget = resolved;
+            let handoff = null;
             try {
                 if (record)
                     record.requestToken = token;
-                if (!screenUnavailable && window.get_workspace() !== workspace)
-                    window.change_workspace(workspace);
-                const alreadyPlaced = placementVerified(this._windowRecord(window), resolved);
-                deferred = screenUnavailable || (
-                    placementNeedsActiveWorkspace(window, global.workspace_manager, workspace) && !alreadyPlaced);
+                const waitingForFrame = stagedHandoff && this._awaitInitialFrame(window, record);
+                const finalAlreadyPlaced = placementVerified(this._windowRecord(window), resolved);
+                const queued = stagedHandoff && allowStaging && this._handoffInFlight(token);
+                if (stagedHandoff && allowStaging && !screenUnavailable && !queued && !waitingForFrame && !finalAlreadyPlaced) {
+                    const active = global.workspace_manager.get_active_workspace();
+                    appliedTarget = this._resolvedTarget({...intent, workspace: active.index(),
+                        state: resolved.state === 'minimized' ? 'normal' : resolved.state});
+                    handoff = intent;
+                }
+                const appliedWorkspace = global.workspace_manager.get_workspace_by_index(appliedTarget.workspace);
+                if (!screenUnavailable && !queued && !waitingForFrame && window.get_workspace() !== appliedWorkspace)
+                    window.change_workspace(appliedWorkspace);
+                const alreadyPlaced = placementVerified(this._windowRecord(window), appliedTarget);
+                deferred = screenUnavailable || queued || waitingForFrame || (
+                    placementNeedsActiveWorkspace(window, global.workspace_manager, appliedWorkspace) && !alreadyPlaced);
                 if (deferred) {
                     if (!record)
                         throw new Error('cannot defer placement for an untracked window');
                     record.deferredPlacement = {token, target: intent};
                 } else if (!alreadyPlaced) {
-                    settleNormal = this._applyResolvedPlacement(window, resolved) === true;
+                    settleNormal = this._applyResolvedPlacement(window, appliedTarget) === true;
                 }
             } finally {
                 this._endExplicitPlacement(window, record);
             }
             this._requests.update(token, deferred ? 'deferred' : 'applied', {
                 deferred, target: intent, resolved_target: resolved, window: this._windowRecord(window),
+                ...(stagedHandoff ? {handoff_owned: true} : {}),
             });
             if (!deferred)
-                this._verifyPlacement(window, token, resolved, settleNormal);
+                this._verifyPlacement(window, token, appliedTarget, settleNormal, handoff);
         } catch (error) {
             this._requests.update(token, 'failed', {message: error.message});
             const record = this._monitorRecords.get(window);
