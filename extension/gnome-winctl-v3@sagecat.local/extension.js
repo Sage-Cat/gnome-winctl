@@ -1528,7 +1528,7 @@ export default class GnomeWinCtlExtension extends Extension {
             build: {uuid: this.uuid, version: this.metadata?.version ?? 1, revision: BUILD_REVISION},
             enable_epoch: this._enableEpoch,
             capabilities: CAPABILITIES,
-            active_workspace: global.workspace_manager.get_active_workspace_index(),
+            active_workspace: global.workspace_manager.get_active_workspace().index(),
             monitors,
             workspaces: this._workspaces(),
             windows: this._windows(monitors),
@@ -1714,7 +1714,8 @@ export default class GnomeWinCtlExtension extends Extension {
 
     _verifyPlacement(window, token, resolved, settleNormal = false, handoff = null) {
         const epoch = this._enableEpoch;
-        const deadline = GLib.get_monotonic_time() + 4000000;
+        const began = GLib.get_monotonic_time();
+        const deadline = began + 4000000;
         let attempts = 0;
         let normalFrame = null;
         let normalSince = null;
@@ -1836,10 +1837,24 @@ export default class GnomeWinCtlExtension extends Extension {
                 } else if (++attempts < 40 && this._enableEpoch === epoch) {
                     return GLib.SOURCE_CONTINUE;
                 } else {
-                    this._requests.update(token, 'failed', {message: 'placement did not verify against the current desktop'});
+                    throw new Error('placement did not verify against the current desktop');
                 }
             } catch (error) {
-                this._requests.update(token, 'failed', {message: error.message});
+                // Keep the failure-time observation, not the initial apply
+                // snapshot, so a late native configure can be diagnosed.
+                const now = GLib.get_monotonic_time();
+                this._requests.update(token, 'failed', {
+                    message: error.message,
+                    window: this._windowRecord(window),
+                    verification: {
+                        elapsed_us: now - began, attempts,
+                        staging_target: resolved, final_target: handoff,
+                        normal_frame: normalFrame,
+                        stable_us: normalSince === null ? 0 : now - normalSince,
+                        position_corrected: positionCorrected,
+                        active_workspace: global.workspace_manager.get_active_workspace().index(),
+                    },
+                });
             }
             this._retrySources.delete(source);
             this._resumeStagedHandoff();
