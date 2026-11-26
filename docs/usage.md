@@ -74,6 +74,23 @@ without moving or exposing the client behind the lock. The same token resumes
 after unlock; caller timeouts do not discard or recreate its final destination.
 Clients should observe that token and cancel it explicitly if no longer wanted.
 
+## Request a close for one window
+
+Read the window's `id`, `workspace`, and `pid` and the top-level `enable_epoch`
+from one `gnome-winctl state --json` response. Use those values together.
+
+```sh
+gnome-winctl close 42 --workspace 1 --pid 1234 --epoch ENABLE_EPOCH --json
+```
+
+Pass `--workspace-name NAME` when closing windows for a configured static
+workspace. The service rechecks the name, index and close eligibility with each
+request. `requested` means the compositor sent the close event. Poll the state
+to confirm the window disappeared and let the application handle save prompts.
+`absent` means the ID is already gone in the current epoch. Both exit with code
+0. A refusal returns `reason` and `message` with code 1, while input and service
+errors return code 2.
+
 ## Reserve placement for a new window
 
 Before launching an application, register a reservation with `expect`. Use an

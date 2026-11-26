@@ -6,14 +6,15 @@ import * as monitorPolicy from '../extension/gnome-winctl-v3@sagecat.local/monit
 import * as windowPlacement from '../extension/gnome-winctl-v3@sagecat.local/windowPlacement.js';
 import * as requests from '../extension/gnome-winctl-v3@sagecat.local/placementRequests.js';
 
-function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
+function fixture({Gio = {}, Main = {}, Meta = {}, display = {}, getWindowActors = () => []} = {}) {
     let clock = 0;
     const timers = new Map();
     let next = 0;
     const workspaces = [0, 1].map(index => ({index: () => index,
         get_work_area_for_monitor: monitor => ({x: monitor * 1000, y: 30, width: 1000, height: 970})}));
     let active = workspaces[0];
-    const manager = {n_workspaces: 2, get_workspace_by_index: index => workspaces[index], get_active_workspace: () => active};
+    const manager = {n_workspaces: 2, get_workspace_by_index: index => workspaces[index],
+        get_active_workspace: () => active, get_active_workspace_index: () => active.index()};
     const GLib = {
         get_monotonic_time: () => clock, uuid_string_random: () => `token-${++next}`,
         timeout_add: (_priority, _ms, callback) => { const id = ++next; timers.set(id, callback); return id; },
@@ -23,7 +24,7 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
     const ExtensionClass = runInNewContext(source.replace(/^import[\s\S]*?;\n/gm, '').replace('export default class', 'class') + '\nGnomeWinCtlExtension;', {
         ...monitorPolicy, ...windowPlacement, ...requests, BUILD_REVISION: 'test-revision',
         Extension: class {}, GLib, Gio, Main, console, Meta: {GrabOp: {}, DisplayDirection: {}, WindowType: {NORMAL: 0}, ...Meta},
-        global: {display, workspace_manager: manager, get_window_actors: () => []},
+        global: {display, workspace_manager: manager, get_window_actors: getWindowActors, get_current_time: () => 100},
     });
     const extension = Object.create(ExtensionClass.prototype);
     extension._enableEpoch = 'epoch-one';
@@ -65,6 +66,135 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}} = {}) {
 }
 
 const target = {workspace: 1, monitor: 1, geometry: {x: 20, y: 30, width: 200, height: 100}, clamp: false};
+
+function closeFixture() {
+    const types = {NORMAL: 0, DESKTOP: 1, DOCK: 2, DIALOG: 3};
+    const clients = {WAYLAND: 0, X11: 1};
+    const windows = [];
+    const actorWindows = [];
+    const requests = [];
+    const f = fixture({
+        display: {list_all_windows: () => windows},
+        Meta: {WindowType: types, WindowClientType: clients},
+        getWindowActors: () => actorWindows.map(meta_window => ({meta_window})),
+    });
+    f.extension._mutterSettings = {get_boolean: () => false};
+    f.extension._monitorPolicyState = () => ({});
+    f.extension._windowRecord = window => ({id: window.id, pid: window.pid, workspace: window.workspace.index()});
+    const windowOn = (index, properties = {}, listed = true) => {
+        const window = {
+            id: 42 + windows.length, pid: 123, workspace: f.manager.get_workspace_by_index(index),
+            type: types.NORMAL, client: clients.WAYLAND, parent: null, sticky: false, override: false, closable: true,
+            ...properties,
+            get_stable_sequence() { return this.id; },
+            get_pid() { return this.pid; },
+            get_workspace() { return this.workspace; },
+            get_window_type() { return this.type; },
+            get_client_type() { return this.client; },
+            get_transient_for() { return this.parent; },
+            is_on_all_workspaces() { return this.sticky; },
+            is_override_redirect() { return this.override; },
+            can_close() { return this.closable; },
+            delete(time) { requests.push([this.id, time]); },
+        };
+        windows.push(window);
+        if (listed)
+            actorWindows.push(window);
+        return window;
+    };
+    const window = windowOn(1);
+    const identity = {id: window.id, pid: window.pid, workspace: 1, epoch: f.extension._enableEpoch};
+    const close = (patch = {}) => JSON.parse(f.extension.CloseWindow(JSON.stringify({...identity, ...patch})));
+    return {...f, requests, window, windowOn, windows, types, clients, close};
+}
+
+test('native close targets an exact inactive window even when another workspace shares its PID', () => {
+    const f = closeFixture();
+    f.windowOn(0);
+    assert.equal(f.close({workspace_name: 'Two'}).status, 'requested');
+    assert.deepEqual(f.requests, [[f.window.id, 100]]);
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+    f.windows.shift();
+    assert.equal(f.close().status, 'absent');
+    assert.deepEqual(JSON.parse(f.extension.ListWindows()).map(window => window.id), [43]);
+    assert.deepEqual(f.requests, [[f.window.id, 100]]);
+});
+
+test('stale epoch, changed PID or workspace, invalid inputs and ambiguous IDs refuse natively', () => {
+    const f = closeFixture();
+    assert.equal(f.close({id: '42'}).reason, 'invalid_request');
+    assert.equal(f.close({pid: 0}).reason, 'invalid_request');
+    assert.equal(f.close({pid: 456}).reason, 'pid_changed');
+    assert.equal(f.close({workspace: 0}).reason, 'workspace_changed');
+    assert.equal(f.close({workspace: 2}).reason, 'missing_workspace');
+    f.extension._enableEpoch = 'epoch-two';
+    assert.equal(f.close().reason, 'stale_epoch');
+    assert.equal(f.close({id: 98}).reason, 'stale_epoch');
+    f.windowOn(0, {id: 42});
+    assert.equal(f.close({epoch: 'epoch-two'}).reason, 'ambiguous_id');
+    assert.deepEqual(f.requests, []);
+});
+
+test('native close protects sticky windows, dialogs, transient parents and unsupported clients', () => {
+    const f = closeFixture();
+    const parent = f.windowOn(0);
+    const dialog = f.windowOn(1, {type: f.types.DIALOG, parent: f.window});
+    assert.equal(f.close().reason, 'transient');
+    assert.equal(f.close({id: dialog.id}).reason, 'unsupported_window');
+    f.windows.pop();
+    f.window.parent = parent;
+    assert.equal(f.close().reason, 'transient');
+    f.window.parent = null;
+    f.window.sticky = true;
+    assert.equal(f.close().reason, 'sticky');
+    f.window.sticky = false;
+    f.window.client = f.clients.X11;
+    assert.equal(f.close().reason, 'unsupported_client');
+    f.window.client = f.clients.WAYLAND;
+    f.window.closable = false;
+    assert.equal(f.close().reason, 'not_closable');
+    assert.deepEqual(f.requests, []);
+});
+
+test('named close rechecks screen, static workspace identity and standalone dialogs', () => {
+    const f = closeFixture();
+    const name = {workspace_name: 'Two'};
+    f.extension._screenUnavailable = () => true;
+    assert.equal(f.close(name).reason, 'screen_unavailable');
+    f.extension._screenUnavailable = () => false;
+    f.extension._mutterSettings.get_boolean = () => true;
+    assert.equal(f.close(name).reason, 'dynamic_workspaces');
+    f.extension._mutterSettings.get_boolean = () => false;
+    f.extension._workspaceSettings.get_strv = () => ['Two', 'Two'];
+    assert.equal(f.close(name).reason, 'workspace_name_changed');
+    f.extension._workspaceSettings.get_strv = () => ['One', 'Renamed'];
+    assert.equal(f.close(name).reason, 'workspace_name_changed');
+    f.extension._workspaceSettings.get_strv = () => ['One', 'Two'];
+    f.windowOn(1, {type: f.types.DIALOG});
+    assert.equal(f.close(name).reason, 'workspace_blocked');
+    assert.deepEqual(f.requests, []);
+});
+
+test('state exposes blockers and ignores desktop, dock and sticky windows when counting unnamed clients', () => {
+    const f = closeFixture();
+    f.extension._workspaceSettings.get_strv = () => ['', 'Two'];
+    f.windowOn(1, {type: f.types.DIALOG, parent: f.window});
+    const sticky = f.windowOn(1, {sticky: true});
+    f.windowOn(1, {type: f.types.DESKTOP});
+    f.windowOn(1, {type: f.types.DOCK});
+    f.windowOn(1, {type: f.types.DIALOG, override: true});
+    f.windowOn(1, {}, false);
+    f.windowOn(0, {type: f.types.DIALOG, sticky: true});
+    const state = JSON.parse(f.extension.GetState());
+    assert.equal(state.enable_epoch, 'epoch-one');
+    assert.equal(state.dynamic_workspaces, false);
+    assert.equal(state.screen_unavailable, false);
+    assert.ok(state.capabilities.includes('close_window'));
+    assert.deepEqual(state.workspaces.map(workspace => [workspace.named, workspace.blocking_windows]), [[false, 0], [true, 2]]);
+    assert.deepEqual(state.windows.map(window => [window.id, window.sticky, window.close_blocker]), [
+        [f.window.id, false, 'transient'], [sticky.id, true, 'sticky'],
+    ]);
+});
 
 function coveredClient() {
     const focus = {id: 'other-application'};

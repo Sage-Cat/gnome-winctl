@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,42 @@ from gnome_winctl import cli, client
 
 
 class RequestContractTests(unittest.TestCase):
+    def test_close_sends_identity_in_one_native_call(self):
+        with patch.object(client, '_json_call', return_value={'status': 'requested'}) as call:
+            result = client.close_window(42, workspace=0, pid=123, epoch='enable-one', workspace_name='Test Space')
+        self.assertEqual(result, {'status': 'requested'})
+        call.assert_called_once()
+        method, identity_json = call.call_args.args
+        self.assertEqual(method, 'CloseWindow')
+        self.assertEqual(json.loads(identity_json), {
+            'id': 42, 'workspace': 0, 'pid': 123, 'epoch': 'enable-one', 'workspace_name': 'Test Space',
+        })
+
+    def test_close_does_not_fall_back_to_legacy_service(self):
+        with patch.object(client, '_json_call', side_effect=client.WinCtlError('unknown method')), \
+             patch.object(client, '_legacy_call') as legacy:
+            with self.assertRaisesRegex(client.WinCtlError, 'unknown method'):
+                client.close_window(42, workspace=0, pid=123, epoch='enable-one')
+        legacy.assert_not_called()
+
+    def test_close_rejects_a_malformed_receipt(self):
+        with patch.object(client, '_json_call', return_value={'status': []}):
+            with self.assertRaisesRegex(client.WinCtlError, 'invalid result'):
+                client.close_window(42, workspace=0, pid=123, epoch='enable-one')
+
+    def test_close_exit_codes_and_json_distinguish_outcomes(self):
+        arguments = ['close', '42', '--workspace', '0', '--pid', '123', '--epoch', 'enable-one', '--json']
+        for status, code in (('requested', 0), ('absent', 0), ('refused', 1)):
+            with self.subTest(status=status), patch.object(cli, 'close_window', return_value={'status': status}) as close, \
+                 patch.object(cli, '_print') as output:
+                self.assertEqual(cli.main(arguments), code)
+                close.assert_called_once_with(42, workspace=0, pid=123, epoch='enable-one', workspace_name=None)
+                output.assert_called_once_with({'status': status, 'ok': code == 0}, as_json=True)
+        with patch.object(cli, 'close_window', side_effect=client.WinCtlError('backend offline')), \
+             patch.object(cli, '_print') as output:
+            self.assertEqual(cli.main(arguments), 2)
+            output.assert_called_once_with({'ok': False, 'error': 'backend offline'}, as_json=True)
+
     def test_monitor_zero_is_not_replaced_by_primary(self):
         args = cli.parser().parse_args(['place', '1', '--monitor', '0', '--workspace', '0', '--geometry', '0,0,10,10'])
         self.assertEqual(cli._target(args)['monitor'], 0)

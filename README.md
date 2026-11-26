@@ -1,6 +1,6 @@
 # gnome-winctl
 
-Inspect, place and recover windows in native GNOME Wayland using a Shell extension
+Inspect, place, close and recover windows in native GNOME Wayland using a Shell extension
 and Python CLI. Applications and session managers handle launching and contents.
 
 ![A placement request changes from deferred to verified](docs/screenshots/placement.png)

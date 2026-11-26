@@ -73,6 +73,36 @@ unique `enable_epoch`. Release staging stamps `buildInfo.js`; a source checkout
 reports revision `development`. This distinguishes installed files from the code
 actually loaded in Shell without triggering a restart.
 
+### Exact window close
+
+The `close_window` capability adds `CloseWindow`, which accepts a JSON object
+with integer `id`, `workspace` and `pid` fields and a string `epoch`. The epoch
+must equal `GetState.enable_epoch` from the state that reported the window. Each
+extension enable generates a new epoch, including after a Shell restart. The
+optional `workspace_name` requires a unique configured name at that index in
+static workspace mode.
+
+The Shell finds the window by ID in its managed window list and checks the
+epoch, workspace, PID and eligibility in the same callback as the close. The
+operation sends the native Wayland close event to that window's surface. The
+client decides how to handle it, including whether to present a save dialog.
+Sibling windows in the same process can remain open. The service refuses
+sticky windows, transients, parents with transient children, locked sessions,
+and clients outside native Wayland. Mutter's XWayland close can fall back to
+disconnecting a client that lacks `WM_DELETE_WINDOW`.
+
+The JSON receipt contains `status` with one of `requested`, `absent`, or
+`refused`. Refusals include a `reason` code and `message` for diagnostics.
+`requested` acknowledges the event and callers can poll `GetState` for the
+result. There is no close method on the legacy session bridge.
+
+For preflight, `GetState` exposes `dynamic_workspaces` and `screen_unavailable`.
+Each workspace reports `named` and `blocking_windows`. The count includes managed
+windows missing from the normal window list, including dialogs, and excludes
+desktop, dock, sticky and override-redirect surfaces. Named close rechecks this
+count before sending the event. Listed windows report `sticky` and `close_blocker`,
+whose value is a refusal code or null when the window itself is eligible.
+
 The project was independently implemented against Mutter's window APIs. The
 Window Calls extension was used as a behavioral reference for the established
 pattern of exposing GNOME Shell window operations over the session bus; none of
