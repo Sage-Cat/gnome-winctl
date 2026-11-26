@@ -9,6 +9,7 @@ from . import __version__
 from .client import (
     WinCtlError,
     cancel_expectation,
+    close_window,
     expect_window,
     expectation_status,
     get_capabilities,
@@ -102,6 +103,13 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("monitors", help="list logical monitors")
     commands.add_parser("workspaces", help="list GNOME workspaces")
 
+    close = commands.add_parser("close", help="request a native close for one exact window")
+    close.add_argument("window_id", metavar="ID", type=int)
+    close.add_argument("--workspace", required=True, type=int, metavar="INDEX", help="expected zero-based workspace index")
+    close.add_argument("--pid", required=True, type=int, help="expected compositor-reported PID")
+    close.add_argument("--epoch", required=True, help="enable_epoch from the same state response as the window")
+    close.add_argument("--workspace-name", metavar="NAME", help="also verify the named static workspace identity")
+
     place = commands.add_parser("place", help="place one existing window")
     _add_selector(place)
     _add_target(place)
@@ -141,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
             result = get_state()
         elif args.command in {"windows", "monitors", "workspaces"}:
             result = get_state().get(args.command, [])
+        elif args.command == "close":
+            result = close_window(
+                args.window_id, workspace=args.workspace, pid=args.pid, epoch=args.epoch,
+                workspace_name=args.workspace_name,
+            )
+            result["ok"] = result["status"] in {"requested", "absent"}
         elif args.command == "place":
             result = place_window(_selector(args), _target(args))
             if args.wait and result.get("token"):
@@ -164,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(result, dict):
         result.setdefault("ok", True)
     _print(result, as_json=as_json)
+    if args.command == "close" and not result["ok"]:
+        return 1
     if args.command == "place" and isinstance(result, dict) and not result.get("placed"):
         if args.wait or result.get("status") not in {"accepted", "deferred", "applied"}:
             return 1

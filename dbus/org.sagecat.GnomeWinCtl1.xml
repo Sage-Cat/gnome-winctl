@@ -15,6 +15,10 @@
     <method name="ListWorkspaces">
       <arg type="s" direction="out" name="workspaces"/>
     </method>
+    <method name="CloseWindow">
+      <arg type="s" direction="in" name="identity"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
     <method name="PlaceWindow">
       <arg type="s" direction="in" name="selector"/>
       <arg type="s" direction="in" name="target"/>

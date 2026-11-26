@@ -53,6 +53,10 @@ const INTERFACE_XML = `
     <method name="ListWorkspaces">
       <arg type="s" direction="out" name="workspaces"/>
     </method>
+    <method name="CloseWindow">
+      <arg type="s" direction="in" name="identity"/>
+      <arg type="s" direction="out" name="result"/>
+    </method>
     <method name="PlaceWindow">
       <arg type="s" direction="in" name="selector"/>
       <arg type="s" direction="in" name="target"/>
@@ -79,6 +83,7 @@ const CAPABILITIES = [
     'list_windows',
     'list_monitors',
     'list_workspaces',
+    'close_window',
     'place_window',
     'expect_window',
     'expectation_status',
@@ -120,6 +125,56 @@ function normalWindows() {
     return global.get_window_actors()
         .map(actor => actor.meta_window)
         .filter(window => window && window.get_window_type() === Meta.WindowType.NORMAL);
+}
+
+const CLOSE_REFUSALS = {
+    invalid_request: 'provide a valid ID, PID, workspace index and enable epoch',
+    stale_epoch: 'window identity belongs to a different extension enable epoch',
+    screen_unavailable: 'the screen is locked or shielded',
+    missing_workspace: 'the requested workspace index does not exist',
+    dynamic_workspaces: 'named close requires static workspaces',
+    workspace_name_changed: 'the requested name is no longer unique at that workspace index',
+    ambiguous_id: 'the window ID is ambiguous',
+    workspace_changed: 'the window is no longer on the requested workspace',
+    pid_changed: 'the window no longer has the requested PID',
+    workspace_blocked: 'the workspace contains an unlisted window or dialog',
+    unsupported_window: 'only normal managed windows can be closed',
+    sticky: 'the window is visible on all workspaces',
+    transient: 'the window is a transient or has a transient child',
+    unsupported_client: 'the window is not a native Wayland client',
+    not_closable: 'the compositor does not allow this window to be closed',
+    invalid_pid: 'the compositor has no valid client PID',
+};
+
+function transientParents(windows) {
+    return new Set(windows.map(window => window.get_transient_for()).filter(Boolean));
+}
+
+function closeBlocker(window, parents) {
+    if (window.get_window_type() !== Meta.WindowType.NORMAL || window.is_override_redirect())
+        return 'unsupported_window';
+    if (window.is_on_all_workspaces())
+        return 'sticky';
+    if (window.get_transient_for() || parents.has(window))
+        return 'transient';
+    // Mutter's X11 delete can fall back to XKillClient when WM_DELETE_WINDOW is absent.
+    if (window.get_client_type() !== Meta.WindowClientType.WAYLAND)
+        return 'unsupported_client';
+    if (!window.can_close())
+        return 'not_closable';
+    if (window.get_pid() <= 0)
+        return 'invalid_pid';
+    return null;
+}
+
+function closeRefused(reason) {
+    return JSON.stringify({status: 'refused', reason, message: CLOSE_REFUSALS[reason]});
+}
+
+function workspaceBlockers(workspace, windows, listed) {
+    return windows.filter(window => !listed.has(window) && !window.is_override_redirect() &&
+        !window.is_on_all_workspaces() && window.get_workspace() === workspace &&
+        ![Meta.WindowType.DESKTOP, Meta.WindowType.DOCK].includes(window.get_window_type())).length;
 }
 
 function normalizeAppId(value) {
@@ -216,6 +271,7 @@ export default class GnomeWinCtlExtension extends Extension {
             wakeRequested: false,
         };
         this._workspaceSettings = new Gio.Settings({schema_id: 'org.gnome.desktop.wm.preferences'});
+        this._mutterSettings = new Gio.Settings({schema_id: 'org.gnome.mutter'});
         this._windowCreatedId = global.display.connect(
             'window-created',
             (_display, window) => {
@@ -311,6 +367,7 @@ export default class GnomeWinCtlExtension extends Extension {
         this._expectations = [];
         this._requests?.records.clear();
         this._workspaceSettings = null;
+        this._mutterSettings = null;
     }
 
     _connectScreenShield() {
@@ -1457,7 +1514,7 @@ export default class GnomeWinCtlExtension extends Extension {
             : monitors;
     }
 
-    _workspaces() {
+    _workspaces(windows = global.display.list_all_windows(), listed = this._listedWindows(windows)) {
         const manager = global.workspace_manager;
         const names = this._workspaceSettings.get_strv('workspace-names');
         const result = [];
@@ -1466,10 +1523,12 @@ export default class GnomeWinCtlExtension extends Extension {
             result.push({
                 index,
                 name: names[index] || `Workspace ${index + 1}`,
+                named: Boolean(names[index]),
                 active: index === manager.get_active_workspace_index(),
                 n_windows: workspace?.list_windows?.().filter(
                     window => window.get_window_type() === Meta.WindowType.NORMAL,
                 ).length ?? 0,
+                blocking_windows: workspaceBlockers(workspace, windows, listed),
             });
         }
         return result;
@@ -1506,8 +1565,18 @@ export default class GnomeWinCtlExtension extends Extension {
         };
     }
 
-    _windows(monitors = this._monitors()) {
-        return normalWindows().map(window => this._windowRecord(window, monitors));
+    _listedWindows(windows) {
+        const managed = new Set(windows);
+        return new Set(normalWindows().filter(window => managed.has(window)));
+    }
+
+    _windows(monitors, windows, listed) {
+        const parents = transientParents(windows);
+        return [...listed].map(window => ({
+            ...this._windowRecord(window, monitors),
+            sticky: window.is_on_all_workspaces(),
+            close_blocker: closeBlocker(window, parents),
+        }));
     }
 
     GetCapabilities() {
@@ -1522,22 +1591,27 @@ export default class GnomeWinCtlExtension extends Extension {
 
     GetState() {
         const monitors = this._monitors();
+        const windows = global.display.list_all_windows();
+        const listed = this._listedWindows(windows);
         return JSON.stringify({
             interface: BUS_NAME,
             interface_version: 1,
             build: {uuid: this.uuid, version: this.metadata?.version ?? 1, revision: BUILD_REVISION},
             enable_epoch: this._enableEpoch,
             capabilities: CAPABILITIES,
+            dynamic_workspaces: this._mutterSettings.get_boolean('dynamic-workspaces'),
+            screen_unavailable: this._screenUnavailable(),
             active_workspace: global.workspace_manager.get_active_workspace().index(),
             monitors,
-            workspaces: this._workspaces(),
-            windows: this._windows(monitors),
+            workspaces: this._workspaces(windows, listed),
+            windows: this._windows(monitors, windows, listed),
             monitor_policy: this._monitorPolicyState(),
         });
     }
 
     ListWindows() {
-        return JSON.stringify(this._windows());
+        const windows = global.display.list_all_windows();
+        return JSON.stringify(this._windows(this._monitors(), windows, this._listedWindows(windows)));
     }
 
     ListMonitors() {
@@ -1546,6 +1620,58 @@ export default class GnomeWinCtlExtension extends Extension {
 
     ListWorkspaces() {
         return JSON.stringify(this._workspaces());
+    }
+
+    CloseWindow(identityJson) {
+        let identity;
+        try {
+            identity = parseObject(identityJson, 'identity');
+        } catch {
+            return closeRefused('invalid_request');
+        }
+        const {id, workspace: index, pid, epoch, workspace_name: name} = identity;
+        if (!Number.isSafeInteger(id) || id < 1 || id > 0xffffffff ||
+            !Number.isSafeInteger(index) || index < 0 || index > 0x7fffffff ||
+            !Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff ||
+            typeof epoch !== 'string' || !epoch ||
+            (name !== undefined && (typeof name !== 'string' || !name)))
+            return closeRefused('invalid_request');
+        if (epoch !== this._enableEpoch)
+            return closeRefused('stale_epoch');
+        if (this._screenUnavailable())
+            return closeRefused('screen_unavailable');
+
+        const manager = global.workspace_manager;
+        const workspace = manager.get_workspace_by_index(index);
+        if (!workspace)
+            return closeRefused('missing_workspace');
+        if (name !== undefined) {
+            if (this._mutterSettings.get_boolean('dynamic-workspaces'))
+                return closeRefused('dynamic_workspaces');
+            const names = this._workspaceSettings.get_strv('workspace-names').slice(0, manager.n_workspaces);
+            if (names[index] !== name || names.indexOf(name) !== names.lastIndexOf(name))
+                return closeRefused('workspace_name_changed');
+        }
+
+        // Resolve all checks and send the close to this Meta.Window in one Shell callback.
+        const windows = global.display.list_all_windows();
+        const matches = windows.filter(window => window.get_stable_sequence() === id);
+        if (!matches.length)
+            return JSON.stringify({status: 'absent'});
+        if (matches.length !== 1)
+            return closeRefused('ambiguous_id');
+        const [window] = matches;
+        const blocker = closeBlocker(window, transientParents(windows));
+        if (blocker)
+            return closeRefused(blocker);
+        if (window.get_workspace() !== workspace)
+            return closeRefused('workspace_changed');
+        if (window.get_pid() !== pid)
+            return closeRefused('pid_changed');
+        if (name !== undefined && workspaceBlockers(workspace, windows, this._listedWindows(windows)))
+            return closeRefused('workspace_blocked');
+        window.delete(global.get_current_time());
+        return JSON.stringify({status: 'requested'});
     }
 
     _matches(window, selector) {

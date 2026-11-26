@@ -277,6 +277,22 @@ def get_capabilities() -> dict[str, Any]:
     return value
 
 
+def close_window(
+    window_id: int, *, workspace: int, pid: int, epoch: str,
+    workspace_name: str | None = None,
+) -> dict[str, Any]:
+    """Request a native close for an identity from the current Shell state."""
+    identity: dict[str, Any] = {
+        "id": window_id, "workspace": workspace, "pid": pid, "epoch": epoch,
+    }
+    if workspace_name is not None:
+        identity["workspace_name"] = workspace_name
+    result = _json_call("CloseWindow", json.dumps(identity))
+    if not isinstance(result, dict) or result.get("status") not in ("requested", "absent", "refused"):
+        raise WinCtlError("CloseWindow returned an invalid result")
+    return result
+
+
 def _workspace_index(spec: Any, state: dict[str, Any]) -> int:
     workspaces = state.get("workspaces", [])
     if isinstance(spec, dict):
