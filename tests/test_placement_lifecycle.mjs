@@ -47,7 +47,7 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}, getWindowActors 
     extension._windowRecord = value => ({workspace: value.workspace.index(), monitor: value.monitor, geometry: value.geometry, state: value.state});
     extension._beginExplicitPlacement = value => {
         let record = extension._monitorRecords.get(value);
-        if (!record) { record = {}; extension._monitorRecords.set(value, record); }
+        if (!record) { record = {dragCount: 0}; extension._monitorRecords.set(value, record); }
         extension._awaitInitialFrame(value, record);
         record.deferredPlacement = null;
         return record;
@@ -1073,4 +1073,134 @@ test('workspace activation during configure rejoins the native queue with the sa
     assert.equal(f.extension._requests.get(receipt.token).target.workspace, 1);
     assert.equal(f.display.focus_window, f.focus);
     assert.equal(f.manager.get_active_workspace().index(), 1);
+});
+
+// The compositor can drop the first explicit placement of a window that is
+// still being mapped. `lose` is how many move_resize_frame calls are ignored
+// (the window keeps its initial frame); `skew` offsets what later calls produce.
+function lossyClient({lose = 1, skew = null} = {}) {
+    const f = coveredClient();
+    let resizes = 0;
+    f.window.move_resize_frame = function (_userOp, x, y, width, height) {
+        if (++resizes <= lose) {
+            if (skew)
+                this.geometry = {x: x + skew.x, y: y + skew.y, width, height};
+            return;
+        }
+        this.geometry = {x, y, width, height};
+    };
+    const logs = [];
+    const original = console.log;
+    console.log = (...args) => { logs.push(args.join(' ')); };
+    const restore = () => { console.log = original; };
+    return {...f, resizes: () => resizes, logs, restore};
+}
+
+const reapplyLog = (token, phase, mode) =>
+    `gnome-winctl: reapplied stalled placement token=${token} phase=${phase} mode=${mode}`;
+
+test('a staged normal placement lost to the initial placement is reapplied once and then handed off', () => {
+    const f = lossyClient();
+    try {
+        const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+        for (let i = 0; i < 9; i++) f.tick();
+        assert.equal(f.resizes(), 1, 'no reapply before the frame has been stuck for one second');
+        for (let i = 0; i < 30; i++) f.tick();
+        assert.equal(f.resizes(), 2);
+        assert.equal(f.extension._requests.get(receipt.token).status, 'verified');
+        assert.equal(f.window.workspace.index(), 1);
+        assert.deepEqual(f.logs, [reapplyLog(receipt.token, 'normal', 'staged')]);
+    } finally { f.restore(); }
+});
+
+test('a direct normal placement whose position was overridden is reapplied once', () => {
+    const f = lossyClient({skew: {x: 25, y: 4}});
+    try {
+        const receipt = f.extension._applyPlacement(f.window, {...target, workspace: 0});
+        for (let i = 0; i < 20; i++) f.tick();
+        assert.equal(f.resizes(), 2);
+        assert.equal(f.extension._requests.get(receipt.token).status, 'verified');
+        assert.deepEqual(f.logs, [reapplyLog(receipt.token, 'normal', 'direct')]);
+    } finally { f.restore(); }
+});
+
+test('a frame that keeps changing is not reapplied until it has been stuck for one second', () => {
+    const f = lossyClient();
+    try {
+        const receipt = f.extension._applyPlacement(f.window, {...target, workspace: 0});
+        for (let i = 0; i < 30; i++) {
+            f.window.geometry.width++;
+            f.tick();
+        }
+        assert.equal(f.resizes(), 1);
+        assert.equal(f.extension._requests.get(receipt.token).status, 'applied');
+        for (let i = 0; i < 12; i++) f.tick();
+        assert.equal(f.resizes(), 2);
+        assert.equal(f.extension._requests.get(receipt.token).status, 'verified');
+    } finally { f.restore(); }
+});
+
+test('a client that never honours the request is reapplied exactly once before the original failure', () => {
+    const f = lossyClient({lose: Infinity});
+    try {
+        const receipt = f.extension._applyPlacement(f.window, {...target, workspace: 0});
+        for (let i = 0; i < 120; i++) f.tick();
+        const request = f.extension._requests.get(receipt.token);
+        assert.equal(f.resizes(), 2);
+        assert.equal(request.status, 'failed');
+        assert.equal(request.message, 'placement verification deadline elapsed');
+        assert.equal(request.verification.reapplied, true);
+        assert.equal(f.logs.length, 1);
+    } finally { f.restore(); }
+});
+
+test('a window under a grab or overview drag is not reapplied', () => {
+    for (const flag of ['grabActive', 'overviewDrag']) {
+        const f = lossyClient();
+        try {
+            f.extension._applyPlacement(f.window, {...target, workspace: 0});
+            f.extension._monitorRecords.get(f.window)[flag] = true;
+            for (let i = 0; i < 30; i++) f.tick();
+            assert.equal(f.resizes(), 1, flag);
+            assert.deepEqual(f.logs, [], flag);
+        } finally { f.restore(); }
+    }
+});
+
+test('a drag that ended during the pass still prevents reapplying to the end of that pass', () => {
+    const f = lossyClient({lose: Infinity});
+    try {
+        const receipt = f.extension._applyPlacement(f.window, {...target, workspace: 0});
+        f.tick();
+        const record = f.extension._monitorRecords.get(f.window);
+        record.grabActive = true;
+        record.dragCount++;
+        f.tick();
+        record.grabActive = false;
+        for (let i = 0; i < 120; i++) f.tick();
+        assert.equal(f.resizes(), 1);
+        assert.equal(f.extension._requests.get(receipt.token).verification.reapplied, false);
+        assert.deepEqual(f.logs, []);
+    } finally { f.restore(); }
+});
+
+test('the final handoff pass and a minimized target are never reapplied', () => {
+    const f = lossyClient({lose: 0});
+    try {
+        f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
+        for (let i = 0; i < 30 && f.window.workspace.index() !== 1; i++) f.tick();
+        assert.equal(f.window.workspace.index(), 1);
+        f.window.geometry = {...f.window.geometry, x: f.window.geometry.x + 50};
+        for (let i = 0; i < 30; i++) f.tick();
+        assert.equal(f.resizes(), 1);
+        assert.deepEqual(f.logs, []);
+    } finally { f.restore(); }
+    const g = lossyClient({lose: 0});
+    try {
+        g.window.minimize = () => {};
+        g.extension._applyPlacement(g.window, {...target, workspace: 0, state: 'minimized'});
+        for (let i = 0; i < 30; i++) g.tick();
+        assert.equal(g.resizes(), 1);
+        assert.deepEqual(g.logs, []);
+    } finally { g.restore(); }
 });

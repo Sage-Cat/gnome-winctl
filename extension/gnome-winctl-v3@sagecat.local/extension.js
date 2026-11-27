@@ -113,6 +113,10 @@ const DISPLAY_CONFIG_MAX_RETRIES = 2;
 const VERIFY_POLL_MS = 100;
 const VERIFY_BUDGET_US = 10 * 1000 * 1000;
 const VERIFY_MAX_ATTEMPTS = VERIFY_BUDGET_US / (VERIFY_POLL_MS * 1000);
+// A frame that has not changed for this long while still missing the applied
+// target lost its first placement (for example to the initial Mutter
+// placement); the pass reapplies the target once.
+const VERIFY_STALL_US = 1000 * 1000;
 const ACTIVE_WORKSPACE_SETTLE_MS = 300;
 const ACTIVE_WORKSPACE_RECOVERY_MS = 3000;
 const RESTORE_RATE_WINDOW_US = 5 * 1000 * 1000;
@@ -770,6 +774,9 @@ export default class GnomeWinCtlExtension extends Extension {
             settling: Boolean(settle),
             explicitDepth: 0,
             grabActive: false,
+            // Counts user drags so a verification pass can tell that one
+            // began while it ran, even after the grab ended.
+            dragCount: 0,
             overviewDrag: false,
             overviewCancelled: false,
             restoring: false,
@@ -859,6 +866,7 @@ export default class GnomeWinCtlExtension extends Extension {
         if (!record)
             return;
         record.grabActive = true;
+        record.dragCount++;
         if (this._screenUnavailable()) {
             record.grabFrozen = true;
             return;
@@ -893,6 +901,7 @@ export default class GnomeWinCtlExtension extends Extension {
         if (!record)
             return;
         record.overviewDrag = true;
+        record.dragCount++;
         record.overviewCancelled = false;
         if (this._screenUnavailable()) {
             record.overviewFrozen = true;
@@ -1863,6 +1872,10 @@ export default class GnomeWinCtlExtension extends Extension {
         let normalFrame = null;
         let normalSince = null;
         let positionCorrected = false;
+        let reapplied = false;
+        const dragsAtStart = this._monitorRecords.get(window)?.dragCount ?? 0;
+        let stallKey = null;
+        let stallSince = began;
         const source = this._timeout(GLib.PRIORITY_DEFAULT, VERIFY_POLL_MS, () => {
             const request = this._requests.get(token);
             if (request.status !== 'applied') {
@@ -1907,6 +1920,31 @@ export default class GnomeWinCtlExtension extends Extension {
                     ? {...request.target, workspace: resolved.workspace, state: resolved.state}
                     : request.target);
                 const sameTarget = this._sameResolvedPlacement(fresh, resolved);
+                const key = JSON.stringify([current.geometry, current.monitor, current.workspace, current.state]);
+                if (key !== stallKey) {
+                    stallKey = key;
+                    stallSince = GLib.get_monotonic_time();
+                }
+                if (!reapplied && sameTarget && GLib.get_monotonic_time() - stallSince >= VERIFY_STALL_US) {
+                    const onTarget = current.state === 'normal' && current.workspace === resolved.workspace &&
+                        current.monitor === resolved.monitor;
+                    const missing = settleNormal ? !onTarget : !placementVerified(current, fresh);
+                    if (missing && resolved.state !== 'minimized' && this._enableEpoch === epoch && !this._screenUnavailable() &&
+                        record?.requestToken === token && !record.grabActive && !record.overviewDrag &&
+                        record.dragCount === dragsAtStart &&
+                        (!request.target.stage_before_handoff ||
+                            windowIsOnActiveWorkspace(window, global.workspace_manager))) {
+                        reapplied = true;
+                        const phase = settleNormal ? 'settle' : resolved.state === 'maximized' ? 'maximized' : 'normal';
+                        const mode = request.target.stage_before_handoff ? 'staged' : 'direct';
+                        console.log(`gnome-winctl: reapplied stalled placement token=${token} phase=${phase} mode=${mode}`);
+                        settleNormal = this._applyResolvedPlacement(window, resolved) === true;
+                        normalFrame = null;
+                        normalSince = null;
+                        stallKey = null;
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                }
                 if (settleNormal) {
                     if (!sameTarget || this._enableEpoch !== epoch || this._screenUnavailable() ||
                         !windowIsOnActiveWorkspace(window, global.workspace_manager) ||
@@ -1995,6 +2033,7 @@ export default class GnomeWinCtlExtension extends Extension {
                         normal_frame: normalFrame,
                         stable_us: normalSince === null ? 0 : now - normalSince,
                         position_corrected: positionCorrected,
+                        reapplied,
                         active_workspace: global.workspace_manager.get_active_workspace().index(),
                     },
                 });
