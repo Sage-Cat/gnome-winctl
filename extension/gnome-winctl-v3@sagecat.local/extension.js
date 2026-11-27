@@ -930,6 +930,12 @@ export default class GnomeWinCtlExtension extends Extension {
     _beginExplicitPlacement(window, intendedAnchor) {
         this._trackWindow(window, false, true);
         const record = this._monitorRecords.get(window) ?? null;
+        if (this._awaitInitialFrame(window, record)) {
+            // Keep the accepted target in the deferred request until it can
+            // apply. A cancelled request must not leave a recovery anchor.
+            this._cancelPlacementIntent(record, true);
+            return record;
+        }
         if (!record)
             return null;
         this._cancelStableMonitorCommit(window, record, true);
@@ -2034,6 +2040,7 @@ export default class GnomeWinCtlExtension extends Extension {
             if (previous && previous !== token)
                 this._requests.update(previous, 'cancelled', {message: 'superseded by a newer explicit placement'});
             const record = this._beginExplicitPlacement(window, resolved.monitor_intent);
+            const waitingForFrame = record?.initialFramePending === true;
             let deferred = false;
             let settleNormal = false;
             let appliedTarget = resolved;
@@ -2041,7 +2048,6 @@ export default class GnomeWinCtlExtension extends Extension {
             try {
                 if (record)
                     record.requestToken = token;
-                const waitingForFrame = stagedHandoff && this._awaitInitialFrame(window, record);
                 const finalAlreadyPlaced = placementVerified(this._windowRecord(window), resolved);
                 const queued = stagedHandoff && allowStaging && this._handoffInFlight(token);
                 if (stagedHandoff && allowStaging && !screenUnavailable && !queued && !waitingForFrame && !finalAlreadyPlaced) {
@@ -2051,7 +2057,10 @@ export default class GnomeWinCtlExtension extends Extension {
                     handoff = intent;
                 }
                 const appliedWorkspace = global.workspace_manager.get_workspace_by_index(appliedTarget.workspace);
-                if (!screenUnavailable && !queued && !waitingForFrame && window.get_workspace() !== appliedWorkspace)
+                // A direct request can assign its workspace before the first
+                // frame. A staged handoff leaves the window where it can map.
+                if (!screenUnavailable && !queued && (!stagedHandoff || !waitingForFrame) &&
+                    window.get_workspace() !== appliedWorkspace)
                     window.change_workspace(appliedWorkspace);
                 const alreadyPlaced = placementVerified(this._windowRecord(window), appliedTarget);
                 deferred = screenUnavailable || queued || waitingForFrame || (
@@ -2064,7 +2073,8 @@ export default class GnomeWinCtlExtension extends Extension {
                     settleNormal = this._applyResolvedPlacement(window, appliedTarget) === true;
                 }
             } finally {
-                this._endExplicitPlacement(window, record);
+                if (!waitingForFrame)
+                    this._endExplicitPlacement(window, record);
             }
             this._requests.update(token, deferred ? 'deferred' : 'applied', {
                 deferred, target: intent, resolved_target: resolved, window: this._windowRecord(window),

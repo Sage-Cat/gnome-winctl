@@ -48,6 +48,7 @@ function fixture({Gio = {}, Main = {}, Meta = {}, display = {}, getWindowActors 
     extension._beginExplicitPlacement = value => {
         let record = extension._monitorRecords.get(value);
         if (!record) { record = {}; extension._monitorRecords.set(value, record); }
+        extension._awaitInitialFrame(value, record);
         record.deferredPlacement = null;
         return record;
     };
@@ -810,6 +811,81 @@ function unmappedClient() {
     return {...f, signals, map};
 }
 
+test('a direct request waits for initial Wayland placement before applying once on the same token', () => {
+    const f = unmappedClient();
+    const apply = f.extension._applyResolvedPlacement;
+    const applied = [];
+    f.extension._applyResolvedPlacement = (window, target) => {
+        applied.push({...window.geometry});
+        apply(window, target);
+    };
+    const saved = {...target, workspace: 0};
+    const pending = f.extension._applyPlacement(f.window, saved);
+    assert.equal(pending.status, 'deferred');
+    assert.equal(pending.handoff_owned, undefined);
+    assert.equal(f.extension._applyPlacement(f.window, saved).token, pending.token);
+    assert.equal(applied.length, 0);
+    assert.equal(f.window.monitor, 0);
+    f.map();
+    assert.equal(applied.length, 0);
+
+    f.tick();
+    assert.deepEqual(applied, [{x: 166, y: 132, width: 800, height: 635}]);
+    f.tick();
+    const verified = JSON.parse(f.extension.ExpectationStatus(pending.token));
+    assert.equal(verified.status, 'verified');
+    assert.equal(verified.token, pending.token);
+    assert.equal(verified.window.monitor, 1);
+    assert.deepEqual(verified.window.geometry, {...saved.geometry, x: 1020});
+    assert.equal(f.signals.size, 0);
+    assert.equal(applied.length, 1);
+});
+
+test('a direct request assigns the destination workspace and waits for its activation', () => {
+    const f = unmappedClient();
+    const pending = f.extension._applyPlacement(f.window, target);
+    assert.equal(pending.status, 'deferred');
+    assert.equal(f.window.workspace.index(), 1);
+    assert.equal(f.manager.get_active_workspace_index(), 0);
+    f.map();
+    f.tick();
+    assert.equal(f.extension._requests.get(pending.token).status, 'deferred');
+    assert.equal(f.window.monitor, 0);
+
+    f.activate(1);
+    f.extension._restoreActiveWorkspace('workspace-activated');
+    f.tick();
+    assert.equal(f.extension._requests.get(pending.token).status, 'verified');
+    assert.equal(f.window.monitor, 1);
+});
+
+test('cancelling an unmapped placement leaves no monitor move for recovery', () => {
+    for (const staged of [false, true]) {
+        const f = unmappedClient();
+        const prototype = Object.getPrototypeOf(f.extension);
+        for (const method of ['_trackWindow', '_beginExplicitPlacement', '_endExplicitPlacement'])
+            f.extension[method] = prototype[method];
+        f.extension._recovery = {active: false, reasons: new Set(), source: 0, generation: 0, pass: 0, totalMoved: 0};
+        f.window.get_monitor = () => f.window.monitor;
+        f.window.get_pid = () => 333;
+        f.window.move_to_monitor = index => { f.window.monitor = index; };
+
+        const pending = f.extension._applyPlacement(f.window, {...target, workspace: 0, stage_before_handoff: staged});
+        assert.equal(pending.status, 'deferred');
+        assert.equal(f.extension.CancelExpectation(pending.token), true);
+        f.map();
+        // The zero-delay first-frame callback runs before monitor grace timers.
+        const [id, firstFrame] = [...f.timers].at(-1);
+        if (firstFrame() === false)
+            f.timers.delete(id);
+        for (let i = 0; i < 5; i++) f.tick(1000000);
+
+        assert.equal(f.extension._requests.get(pending.token).status, 'cancelled');
+        assert.equal(f.window.monitor, 0);
+        assert.equal(f.extension._monitorRecords.get(f.window).anchor.serial, 'A');
+    }
+});
+
 test('a zero-size new window retains its final receipt until initial placement finishes', () => {
     const f = unmappedClient();
     const saved = {...target, workspace: 0, monitor: 0,
@@ -842,28 +918,32 @@ test('an unmapped window does not block another window from finishing the native
     assert.equal(f.extension._requests.get(waiting.token).status, 'verified');
 });
 
-test('initial-frame readiness preserves screen-lock and cancellation authority', () => {
-    for (const change of ['lock', 'cancel', 'unmanage']) {
-        const f = unmappedClient();
-        const waiting = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
-        if (change === 'lock') f.extension._screenUnavailable = () => true;
-        if (change === 'cancel') f.extension.CancelExpectation(waiting.token);
-        f.map();
-        if (change === 'unmanage') f.extension._untrackWindow(f.window);
-        if (change === 'lock') f.advance(3600000000);
-        for (let i = 0; i < 8; i++) f.tick();
-        assert.equal(f.window.geometry.x, 166, change);
-        assert.equal(f.signals.size, 0, change);
-        assert.equal(f.extension._requests.get(waiting.token).status,
-            change === 'lock' ? 'deferred' : change === 'cancel' ? 'cancelled' : 'failed');
-        if (change === 'lock') {
-            f.extension._screenUnavailable = () => false;
-            f.extension._resumeStagedHandoff();
+for (const staged of [false, true]) {
+    test(`initial-frame readiness preserves lock, cancellation and cleanup for ${staged ? 'staged' : 'direct'} requests`, () => {
+        for (const change of ['lock', 'cancel', 'unmanage']) {
+            const f = unmappedClient();
+            const waiting = f.extension._applyPlacement(f.window, {
+                ...target, workspace: staged ? 1 : 0, stage_before_handoff: staged,
+            });
+            if (change === 'lock') f.extension._screenUnavailable = () => true;
+            if (change === 'cancel') f.extension.CancelExpectation(waiting.token);
+            f.map();
+            if (change === 'unmanage') f.extension._untrackWindow(f.window);
+            if (change === 'lock') f.advance(3600000000);
             for (let i = 0; i < 8; i++) f.tick();
-            assert.equal(f.extension._requests.get(waiting.token).status, 'verified');
+            assert.equal(f.window.geometry.x, 166, change);
+            assert.equal(f.signals.size, 0, change);
+            assert.equal(f.extension._requests.get(waiting.token).status,
+                change === 'lock' ? 'deferred' : change === 'cancel' ? 'cancelled' : 'failed');
+            if (change === 'lock') {
+                f.extension._screenUnavailable = () => false;
+                f.extension._restoreActiveWorkspace('screen-unlocked');
+                for (let i = 0; i < 8; i++) f.tick();
+                assert.equal(f.extension._requests.get(waiting.token).status, 'verified');
+            }
         }
-    }
-});
+    });
+}
 
 test('a new final request supersedes an unmapped request without reviving its receipt', () => {
     const f = unmappedClient();
