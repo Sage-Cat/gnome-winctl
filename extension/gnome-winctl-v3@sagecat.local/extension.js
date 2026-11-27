@@ -107,6 +107,12 @@ const RECOVERY_VERIFY_MS = 650;
 const RECOVERY_MAX_PASSES = 3;
 const DISPLAY_CONFIG_RETRY_MS = 600;
 const DISPLAY_CONFIG_MAX_RETRIES = 2;
+// Each verification pass may wait for a slow client to settle its normal frame
+// and accept maximize; a loaded Electron guest took ~3.6 s just to settle. A
+// staged handoff verifies its final workspace in a separate pass.
+const VERIFY_POLL_MS = 100;
+const VERIFY_BUDGET_US = 10 * 1000 * 1000;
+const VERIFY_MAX_ATTEMPTS = VERIFY_BUDGET_US / (VERIFY_POLL_MS * 1000);
 const ACTIVE_WORKSPACE_SETTLE_MS = 300;
 const ACTIVE_WORKSPACE_RECOVERY_MS = 3000;
 const RESTORE_RATE_WINDOW_US = 5 * 1000 * 1000;
@@ -1852,12 +1858,12 @@ export default class GnomeWinCtlExtension extends Extension {
     _verifyPlacement(window, token, resolved, settleNormal = false, handoff = null) {
         const epoch = this._enableEpoch;
         const began = GLib.get_monotonic_time();
-        const deadline = began + 4000000;
+        const deadline = began + VERIFY_BUDGET_US;
         let attempts = 0;
         let normalFrame = null;
         let normalSince = null;
         let positionCorrected = false;
-        const source = this._timeout(GLib.PRIORITY_DEFAULT, 100, () => {
+        const source = this._timeout(GLib.PRIORITY_DEFAULT, VERIFY_POLL_MS, () => {
             const request = this._requests.get(token);
             if (request.status !== 'applied') {
                 this._retrySources.delete(source);
@@ -1971,7 +1977,7 @@ export default class GnomeWinCtlExtension extends Extension {
                         return GLib.SOURCE_REMOVE;
                     }
                     this._requests.update(token, 'verified', {window: current, deferred: false});
-                } else if (++attempts < 40 && this._enableEpoch === epoch) {
+                } else if (++attempts < VERIFY_MAX_ATTEMPTS && this._enableEpoch === epoch) {
                     return GLib.SOURCE_CONTINUE;
                 } else {
                     throw new Error('placement did not verify against the current desktop');
@@ -2029,7 +2035,7 @@ export default class GnomeWinCtlExtension extends Extension {
             if (directRequest && previous && previous !== token) {
                 const owned = this._requests.get(previous);
                 if ((owned.status === 'deferred' ||
-                    owned.status === 'applied' && GLib.get_monotonic_time() - owned.updated_at < 4000000) &&
+                    owned.status === 'applied' && GLib.get_monotonic_time() - owned.updated_at < VERIFY_BUDGET_US) &&
                     (!stagedHandoff || owned.handoff_owned === true) &&
                     owned.resolved_target && this._sameResolvedPlacement(owned.resolved_target, resolved) &&
                     this._sameResolvedPlacement(this._resolvedTarget(owned.target), resolved)) {

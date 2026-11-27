@@ -479,7 +479,7 @@ test('a compositor that accepts calls without applying geometry never produces v
     const result = f.extension._applyPlacement(f.window, {...target, workspace: 0});
     assert.equal(result.status, 'applied');
     assert.equal(result.placed, false);
-    for (let attempt = 0; attempt < 40; attempt++) f.tick();
+    for (let attempt = 0; attempt < 100; attempt++) f.tick();
     assert.equal(JSON.parse(f.extension.ExpectationStatus(result.token)).status, 'failed');
 });
 
@@ -679,6 +679,25 @@ test('maximize waits for a settled normal frame without demanding impossible nor
     assert.equal(f.manager.get_active_workspace().index(), 0);
 });
 
+test('a slow client whose normal frame settles after 3.6 s is still maximized, verified and handed off', () => {
+    const f = maximizingClient();
+    const result = f.extension._applyPlacement(f.window, {...maximizedTarget, workspace: 1, stage_before_handoff: true});
+    // The frame keeps changing for longer than the former four-second limit.
+    for (let i = 0; i < 36; i++) {
+        f.window.geometry.width++;
+        f.tickAfter(100000);
+    }
+    assert.equal(f.maximizes(), 0);
+    assert.equal(f.extension._requests.get(result.token).status, 'applied');
+    for (let i = 0; i < 6; i++) f.tickAfter(100000);
+    assert.equal(f.maximizes(), 1);
+    for (let i = 0; i < 4; i++) f.tickAfter(100000);
+    assert.equal(f.extension._requests.get(result.token).status, 'verified');
+    assert.equal(f.window.workspace.index(), 1);
+    assert.equal(f.window.state, 'maximized');
+    assert.equal(f.manager.get_active_workspace().index(), 0);
+});
+
 test('a changing normal frame resets the maximize stability interval', () => {
     const f = maximizingClient();
     f.extension._applyPlacement(f.window, maximizedTarget);
@@ -739,12 +758,16 @@ test('cancel, lock, workspace, ownership, topology and epoch changes prevent del
 test('a normal frame that never settles fails within the original bounded request', () => {
     const f = maximizingClient();
     const first = f.extension._applyPlacement(f.window, maximizedTarget);
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 99; i++) {
         f.window.geometry.width++;
         f.tickAfter(100000);
+        assert.equal(f.extension._requests.get(first.token).status, 'applied');
     }
+    f.window.geometry.width++;
+    f.tickAfter(100000);
     assert.equal(f.maximizes(), 0);
     assert.equal(f.extension._requests.get(first.token).status, 'failed');
+    assert.equal(f.extension._requests.get(first.token).message, 'placement verification deadline elapsed');
     assert.equal(f.timers.size, 0);
 });
 
@@ -756,7 +779,7 @@ test('deduplication never reuses a request bound to stale topology or an expired
             f.setMonitors([{index: 0, primary: true, x: 0, y: 0, width: 1000, height: 1000, serial: 'B'},
                 {index: 1, x: 1000, y: 0, width: 1000, height: 1000, serial: 'A'}]);
         } else {
-            f.advance(4100000); // No callback has run yet.
+            f.advance(10100000); // No callback has run yet.
         }
         const second = f.extension._applyPlacement(f.window, first.target);
         assert.notEqual(second.token, first.token, change);
@@ -769,7 +792,7 @@ test('a delayed callback cannot maximize after its wall-clock deadline', () => {
     const f = maximizingClient();
     const first = f.extension._applyPlacement(f.window, maximizedTarget);
     f.tickAfter(100000);
-    f.tickAfter(4100000);
+    f.tickAfter(10100000);
     assert.equal(f.maximizes(), 0);
     assert.equal(f.extension._requests.get(first.token).status, 'failed');
     assert.equal(f.timers.size, 0);
@@ -1005,7 +1028,7 @@ test('normal position instability never produces success or repeated corrections
     const receipt = f.extension._applyPlacement(f.window, {...target, stage_before_handoff: true});
     f.acknowledgeSize();
     f.tick();
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 100; i++) {
         f.window.geometry.x = i % 2 ? 1045 : 1020;
         f.tick();
     }
@@ -1026,7 +1049,7 @@ test('normal correction respects cancellation, grabs, topology, epoch and the or
         if (change === 'owner') f.extension._monitorRecords.get(f.window).requestToken = 'new-owner';
         if (change === 'topology') f.setMonitors([{index: 0, primary: true, x: 0, y: 0, width: 1000, height: 1000, serial: 'A'}]);
         if (change === 'epoch') f.extension._enableEpoch = 'epoch-two';
-        if (change === 'deadline') f.advance(4100000);
+        if (change === 'deadline') f.advance(10100000);
         if (change === 'lock') f.extension._screenUnavailable = () => true;
         f.tick();
         assert.equal(f.moves(), 0, change);
