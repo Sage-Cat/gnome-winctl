@@ -249,6 +249,33 @@ class ClientTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_windows_keeps_recovery_intent_separate_from_the_observed_monitor(self):
+        intent = {"connector": "HDMI-1", "serial": "saved-display"}
+        monitor = {"index": 1, "connector": "DP-1", "x": 1920, "y": 0}
+        frame = {"x": 1950, "y": 40, "width": 800, "height": 600}
+        state = {
+            "workspaces": STATE["workspaces"],
+            "monitors": [{"index": 0, **intent}, monitor],
+            "windows": [{
+                "workspace": 1, "monitor": 1, "monitor_geometry": monitor,
+                "monitor_intent": intent, "geometry": frame,
+            }],
+        }
+        with patch("gnome_winctl.client._json_call", return_value=state), patch(
+            "gnome_winctl.client._monitor_xml_identities", return_value={},
+        ), patch(
+            "gnome_winctl.client._edid_hashes", return_value={"DP-1": "fallback-display"},
+        ), patch("gnome_winctl.cli._print") as output:
+            self.assertEqual(main(["windows", "--json"]), 0)
+        window = output.call_args.args[0][0]
+        self.assertEqual(window["monitor"], 1)
+        self.assertEqual(window["monitor_identity"]["edid_hash"], "fallback-display")
+        self.assertEqual(window["monitor_intent"], intent)
+        self.assertEqual(window["geometry"], frame)
+        target = normalize_target(window, state)
+        self.assertEqual(target["monitor"], 0)
+        self.assertEqual(target["geometry"], {**frame, "x": 30})
+
     def test_geometry_requires_four_integers(self):
         self.assertEqual(_geometry("1,2,800,600")["width"], 800)
         with self.assertRaisesRegex(ValueError, "X,Y,WIDTH,HEIGHT"):

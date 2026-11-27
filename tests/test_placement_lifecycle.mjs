@@ -196,6 +196,40 @@ test('state exposes blockers and ignores desktop, dock and sticky windows when c
     ]);
 });
 
+test('windows retain a pending physical anchor alongside the observed compositor frame', () => {
+    const f = closeFixture();
+    f.extension._windowRecord = Object.getPrototypeOf(f.extension)._windowRecord;
+    const frame = {x: 20, y: 30, width: 200, height: 100};
+    Object.assign(f.window, {
+        get_title: () => 'Terminal', get_monitor: () => 0, get_frame_rect: () => frame,
+        has_focus: () => false, is_fullscreen: () => false, get_maximized: () => 0,
+    });
+    const listed = () => JSON.parse(f.extension.ListWindows())[0];
+    const record = {workspaceRecoveryPending: true,
+        anchor: monitorPolicy.captureMonitorAnchor({index: 1, x: 1000, connector: 'HDMI-2', serial: 'B'})};
+    assert.equal(listed().monitor_intent, undefined);
+    f.extension._monitorRecords.set(f.window, record);
+
+    const observed = listed();
+    assert.deepEqual(JSON.parse(f.extension.GetState()).windows[0], observed);
+    assert.equal(observed.monitor, 0);
+    assert.equal(observed.monitor_geometry.index, 0);
+    assert.deepEqual(observed.geometry, frame);
+    assert.deepEqual(observed.geometry_relative, frame);
+    assert.equal(observed.monitor_intent.connector, 'HDMI-2');
+    assert.equal(observed.monitor_intent.serial, 'B');
+    assert.equal(observed.monitor_intent.fallback, null);
+    assert.equal(requests.placementVerified(observed, {
+        workspace: 1, monitor: 1, geometry: frame, state: 'normal',
+    }), false);
+
+    record.workspaceRecoveryPending = false;
+    assert.equal(listed().monitor_intent, undefined);
+    record.workspaceRecoveryPending = true;
+    record.anchor = monitorPolicy.captureMonitorAnchor({index: 1, x: 1000});
+    assert.equal(listed().monitor_intent, undefined);
+});
+
 function coveredClient() {
     const focus = {id: 'other-application'};
     const display = {focus_window: focus};
