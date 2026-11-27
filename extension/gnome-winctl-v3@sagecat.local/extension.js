@@ -1572,11 +1572,16 @@ export default class GnomeWinCtlExtension extends Extension {
 
     _windows(monitors, windows, listed) {
         const parents = transientParents(windows);
-        return [...listed].map(window => ({
-            ...this._windowRecord(window, monitors),
-            sticky: window.is_on_all_workspaces(),
-            close_blocker: closeBlocker(window, parents),
-        }));
+        return [...listed].map(window => {
+            const record = this._monitorRecords?.get(window);
+            const intent = record?.workspaceRecoveryPending ? captureMonitorIntent(record.anchor) : null;
+            return {
+                ...this._windowRecord(window, monitors),
+                ...(intent ? {monitor_intent: intent} : {}),
+                sticky: window.is_on_all_workspaces(),
+                close_blocker: closeBlocker(window, parents),
+            };
+        });
     }
 
     GetCapabilities() {
