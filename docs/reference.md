@@ -47,7 +47,9 @@ activates another workspace.
 
 Maximizing waits for the normal frame to settle for 400 ms before applying the
 maximized state. Final verification uses the current monitor work area. Each
-request has a four-second verification limit. Repeating an identical in-flight
+verification pass, including the normal-frame settle and maximize, has a
+ten-second limit; a staged handoff verifies its final workspace in a separate
+pass with its own limit. Repeating an identical in-flight
 request reuses its token; a changed target or desktop topology starts a new one.
 
 ## D-Bus API
