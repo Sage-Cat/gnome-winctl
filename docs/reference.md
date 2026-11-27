@@ -34,6 +34,12 @@ without moving the window to an unrelated fallback. Recovery is move-bounded and
 retry circuit breaker. `gnome-winctl state` reports the policy state under
 `monitor_policy`.
 
+`GetState` and `ListWindows` include a window's physical `monitor_intent` while
+workspace recovery owns its anchor. The window's `monitor`, `monitor_geometry`,
+`geometry`, and `geometry_relative` describe the current compositor observation.
+The CLI enriches that observation as `monitor_identity` and preserves the intent
+for snapshot consumers.
+
 An explicit frame change on the active workspace raises the window so covered
 Wayland clients can finish pending moves and resizes. It does not take keyboard
 focus. Already verified placements preserve stacking order; placement never
